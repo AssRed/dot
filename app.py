@@ -1,26 +1,19 @@
 """FastAPI entrypoint for hosted deployment (Fly.io / any container host).
 
-Exposes a tiny HTTP surface for healthchecks while running the bot's
-long-polling loop as an asyncio background task on the same event loop.
-
-Why FastAPI?
-    Most managed container platforms (Fly.io, Railway with web service,
-    Cloud Run) expect an HTTP service that listens on ``$PORT``. A worker-
-    only container is trickier to configure and to keep alive. By bundling
-    a small FastAPI app we:
-      * give the platform an obvious "is alive" endpoint,
-      * keep a single process,
-      * still use the native aiogram polling (no webhook plumbing),
-      * trivially fall back to ``python main.py`` for VPS / Railway worker
-        deployments.
+Uses Telegram **webhook** mode so that incoming updates are delivered as
+HTTP POSTs to the `/webhook/{secret}` endpoint. This plays nicely with
+Fly.io's auto-stop / auto-start: incoming updates wake the machine if
+it is idle, and the worker doesn't have to keep a long-poll connection
+open 24/7.
 
 Run locally:
     uvicorn app:app --host 0.0.0.0 --port 8080
 """
 from __future__ import annotations
 
-import asyncio
 import logging
+import os
+import secrets as _secrets
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
@@ -29,7 +22,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 
 from config import Settings
 from database import Database
@@ -40,6 +33,17 @@ from main import setup_logging
 from utils.scheduler import start_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_webhook_base() -> str | None:
+    """Return public HTTPS base URL for the bot, or None if unknown."""
+    explicit = os.getenv("WEBHOOK_BASE_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    fly_app = os.getenv("FLY_APP_NAME", "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev"
+    return None
 
 
 @asynccontextmanager
@@ -75,31 +79,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     scheduler = start_scheduler(bot, db, settings.master_tg_id, tz=settings.tz)
 
-    # Drop any pending webhook so polling can take over cleanly.
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("delete_webhook failed (likely no webhook set): %s", exc)
-
-    polling_task = asyncio.create_task(dp.start_polling(bot))
-    log.info("Bot polling started")
+    # Webhook setup
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip() or _secrets.token_urlsafe(32)
+    webhook_base = _resolve_webhook_base()
+    webhook_path = f"/webhook/{webhook_secret}"
 
     app.state.settings = settings
     app.state.bot = bot
     app.state.dispatcher = dp
     app.state.db = db
     app.state.scheduler = scheduler
-    app.state.polling_task = polling_task
+    app.state.webhook_secret = webhook_secret
+
+    if webhook_base:
+        webhook_url = f"{webhook_base}{webhook_path}"
+        try:
+            await bot.set_webhook(
+                url=webhook_url,
+                drop_pending_updates=False,
+                allowed_updates=["message", "callback_query"],
+            )
+            log.info("Webhook set to %s", webhook_url)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Failed to set webhook to %s: %s", webhook_url, exc)
+    else:
+        log.warning(
+            "No WEBHOOK_BASE_URL or FLY_APP_NAME — webhook NOT set. "
+            "Bot will not receive updates until you set the webhook manually."
+        )
 
     try:
         yield
     finally:
         log.info("Shutting down")
-        await dp.stop_polling()
-        polling_task.cancel()
         try:
-            await polling_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            await bot.delete_webhook(drop_pending_updates=False)
+        except Exception:  # noqa: BLE001
             pass
         scheduler.shutdown(wait=False)
         await bot.session.close()
@@ -121,3 +136,16 @@ async def root() -> dict[str, str]:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request) -> dict[str, bool]:
+    expected = getattr(request.app.state, "webhook_secret", None)
+    if not expected or secret != expected:
+        raise HTTPException(status_code=404, detail="Not found")
+    payload = await request.json()
+    bot: Bot = request.app.state.bot
+    dp: Dispatcher = request.app.state.dispatcher
+    update = Update.model_validate(payload, context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return {"ok": True}
