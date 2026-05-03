@@ -142,6 +142,26 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 может усыпать инстанс при простое — Telegram разбудит его новым
 update'ом.
 
+### Render (бесплатный, без карты)
+1. https://dashboard.render.com → **New +** → **Web Service**.
+2. **Connect a repository** → выбрать `AssRed/dot`.
+3. Settings:
+   - **Name**: `beauty-master-bot` (URL будет `https://beauty-master-bot.onrender.com`).
+   - **Region**: `Frankfurt` или `Oregon`.
+   - **Branch**: `devin/1777743135-bootstrap-bot`.
+   - **Runtime**: `Docker` (auto-detected по `Dockerfile`).
+   - **Instance Type**: `Free`.
+4. Environment variables:
+   - `BOT_TOKEN`
+   - `MASTER_TG_ID`
+   - `DATABASE_URL` (Postgres URL от [Neon](https://neon.tech))
+   - `WEBHOOK_BASE_URL=https://beauty-master-bot.onrender.com`
+   - (опционально) `TZ=Europe/Moscow`
+5. **Create Web Service** → подождать ~3 мин до `Live`.
+
+> Free Web Service на Render засыпает после 15 мин простоя; первый запрос после сна
+> занимает ~30 сек, но Telegram повторит webhook, так что сообщения не теряются.
+
 ### Koyeb (бесплатный nano)
 1. https://app.koyeb.com → **Create Service** → **GitHub** → выбрать репозиторий.
 2. Build: **Dockerfile** (auto-detected).
