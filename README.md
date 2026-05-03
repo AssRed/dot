@@ -71,7 +71,7 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 
 - Python 3.10+ (рекомендуется 3.11)
 - [aiogram 3](https://docs.aiogram.dev/) — асинхронный фреймворк для Telegram.
-- [aiosqlite](https://github.com/omnilib/aiosqlite) — асинхронный SQLite.
+- [asyncpg](https://magicstack.github.io/asyncpg/) — асинхронный драйвер PostgreSQL.
 - [APScheduler](https://apscheduler.readthedocs.io/) — напоминания.
 - [openpyxl](https://openpyxl.readthedocs.io/) — Excel-отчёты.
 - [python-dotenv](https://pypi.org/project/python-dotenv/) — конфигурация.
@@ -112,14 +112,16 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
    ```
    BOT_TOKEN=токен_от_BotFather
    MASTER_TG_ID=ваш_telegram_id
+   DATABASE_URL=postgresql://user:password@host/db?sslmode=require
    ```
-   Узнать свой Telegram ID можно у `@userinfobot`.
+   - Telegram ID можно узнать у `@userinfobot`.
+   - Бесплатный Postgres: [Neon](https://neon.tech) (без карты), Supabase, Railway.
 4. Запустите:
    ```bash
    python main.py
    ```
 
-База данных `bot.db` будет создана автоматически.
+Схема и таблицы создаются автоматически при первом подключении.
 
 ## Первая настройка (после запуска)
 
@@ -133,22 +135,31 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 
 После этого можно делиться ссылкой на бота с клиентами.
 
-## Деплой на Railway
+## Деплой
 
-1. Создайте новый проект на [Railway](https://railway.app/).
-2. Подключите этот GitHub-репозиторий.
-3. В разделе **Variables** добавьте:
+Подходит любой контейнерный хост, поддерживающий `Dockerfile`. Бот
+работает в **webhook-режиме** через FastAPI (`app:app`), поэтому хост
+может усыпать инстанс при простое — Telegram разбудит его новым
+update'ом.
+
+### Koyeb (бесплатный nano)
+1. https://app.koyeb.com → **Create Service** → **GitHub** → выбрать репозиторий.
+2. Build: **Dockerfile** (auto-detected).
+3. Region: `was` или `fra`. Instance: `Eco/Free`.
+4. Environment variables:
    - `BOT_TOKEN`
    - `MASTER_TG_ID`
-   - (опционально) `TZ`, `DB_PATH`
-4. Railway сам определит Python-проект и использует `Procfile`
-   (`worker: python main.py`).
-5. (Рекомендуется) Подключите **Volume** к каталогу `/app`, чтобы
-   `bot.db` пережил перезапуски. Альтернатива — поменять `DB_PATH`
-   на путь внутри volume.
+   - `DATABASE_URL` (Postgres URL, например от [Neon](https://neon.tech))
+   - `WEBHOOK_BASE_URL=https://<your-app>.koyeb.app`
+   - (опционально) `TZ=Europe/Moscow`
+5. Health check: HTTP GET `/health` на порту `8080`.
 
-После деплоя бот сразу начнёт принимать сообщения. Если поменяли
-`BOT_TOKEN` — Railway автоматически перезапустит сервис.
+### Fly.io
+```bash
+fly secrets set BOT_TOKEN=... MASTER_TG_ID=... DATABASE_URL=...
+fly deploy
+```
+Webhook URL подхватывается автоматически из `FLY_APP_NAME`.
 
 ## Деплой на VPS (systemd)
 

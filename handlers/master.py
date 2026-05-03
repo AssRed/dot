@@ -1557,7 +1557,7 @@ async def analytics_cmd(
     weekday_totals: dict[int, int] = {i: 0 for i in range(7)}
     hour_totals: dict[int, int] = {}
     for row in heatmap:
-        # SQLite strftime('%w') returns 0=Sunday … 6=Saturday — convert to 0=Mon.
+        # EXTRACT(DOW) returns 0=Sunday … 6=Saturday — convert to 0=Mon.
         wd = (int(row["weekday_sun0"]) - 1) % 7
         weekday_totals[wd] = weekday_totals.get(wd, 0) + int(row["cnt"])
         h = int(row["hour"])

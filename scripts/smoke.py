@@ -3,7 +3,7 @@
 This script does NOT need a real Telegram token — it only verifies that the
 codebase loads, the database initialises, and the pure helpers behave.
 
-Run it from the project root:
+Run it from the project root (requires DATABASE_URL for full DB checks):
 
     python scripts/smoke.py
 """
@@ -12,13 +12,24 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # Make the project root importable when run from anywhere.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+
+async def _reset_schema(db) -> None:
+    """Drop all known tables so smoke runs are deterministic."""
+    tables = [
+        "appointments", "transactions", "client_notes", "client_tags",
+        "waitlist", "broadcasts", "schedule", "services", "welcome_texts",
+        "settings", "master_info", "users",
+    ]
+    async with db.connect() as conn:
+        for t in tables:
+            await conn.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
 
 
 async def _run() -> None:
@@ -32,19 +43,25 @@ async def _run() -> None:
     from handlers import client, common, master
     from utils import forecast, report, scheduler, slots
 
-    # Touch every imported module so pyflakes is satisfied and we get a real
-    # smoke signal on the imports.
     for module in (keyboards, client, common, master, scheduler):
         assert module.__name__
+
+    if not os.getenv("DATABASE_URL"):
+        print("[skip] DATABASE_URL not set — running import-only smoke.")
+        print("\nIMPORT-ONLY SMOKE CHECKS PASSED")
+        return
 
     settings = config.Settings.load()
     print(f"[ok] settings loaded: master={settings.master_tg_id}")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        db_path = Path(tmp) / "test.db"
-        db = database.Database(db_path)
+    db = database.Database(settings.database_url)
+    await db.init()
+    print("[ok] schema initialised")
+
+    try:
+        await _reset_schema(db)
         await db.init()
-        print("[ok] schema initialised")
+        print("[ok] schema reset (clean smoke run)")
 
         # Seed master + a sample client + a service + a schedule.
         await db.upsert_user_visit(settings.master_tg_id, role="master")
@@ -149,6 +166,8 @@ async def _run() -> None:
             f"[ok] analytics: top={len(top)} heatmap_cells={len(heat)} "
             f"bookings={funnel.get('bookings')}"
         )
+    finally:
+        await db.close()
 
     print("\nALL SMOKE CHECKS PASSED")
 
