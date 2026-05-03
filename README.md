@@ -163,11 +163,30 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 Все события пишутся в `bot.log` (ротация по 1 МБ, 3 файла) и в окно
 консоли. Если бот ведёт себя странно — посмотрите в `bot.log`.
 
-## Деплой на VPS (опционально, для 24/7)
+## Деплой на Railway (опционально, для 24/7)
 
-Если вам нужно, чтобы бот работал постоянно даже при выключенном ноутбуке —
-аренда VPS у российского провайдера (Beget, Timeweb, Reg.ru) от ~150 ₽/мес.
-Пример unit-файла systemd:
+Railway даёт $5 trial-кредит при привязке карты, потом pay-as-you-go ~$5/мес.
+Шаги:
+
+1. https://railway.app → Sign in with GitHub.
+2. **New Project** → **Deploy from GitHub repo** → выбрать `AssRed/dot`.
+3. Railway автоматически прочитает `railway.json` и запустит `python main.py`.
+4. Перейти в **Settings → Volumes** → **Create Volume**:
+   - **Mount path**: `/data`
+   - Size: 1 GB (хватит на годы записей)
+5. Перейти в **Variables** и добавить:
+   - `BOT_TOKEN` — токен от `@BotFather`
+   - `MASTER_TG_ID` — ваш Telegram ID
+   - `DB_PATH=/data/bot.db` — чтобы база жила в volume
+   - (опционально) `TZ=Europe/Moscow`
+6. Дождаться зелёной галочки **Active**. В Telegram открыть бота, отправить `/start`.
+
+База `bot.db` живёт в volume — переживает редеплои и рестарты.
+
+## Деплой на VPS (опционально, для 24/7 без облаков)
+
+Если хотите своё железо — VPS у российского провайдера (Beget, Timeweb,
+Reg.ru) от ~150 ₽/мес. Пример unit-файла systemd:
 
 ```ini
 # /etc/systemd/system/beauty-bot.service
