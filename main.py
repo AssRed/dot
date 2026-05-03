@@ -72,6 +72,8 @@ async def main() -> None:
     scheduler = start_scheduler(bot, db, settings.master_tg_id, tz=settings.tz)
     log.info("Bot started")
     try:
+        # Drop any previously-registered webhook so polling receives updates.
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown(wait=False)
