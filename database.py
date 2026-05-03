@@ -1,20 +1,22 @@
-"""PostgreSQL access layer for the beauty-master bot.
+"""SQLite database access layer for the beauty-master bot.
 
-Uses asyncpg + a thin compatibility layer so the rest of the codebase
-keeps using ``?``-style placeholders. The schema is created on first
-connection; column migrations are idempotent.
+All functions are async and rely on :mod:`aiosqlite`. The schema is created
+on the first connection. Default settings, welcome texts and an empty
+master_info row are inserted on first run.
 """
 from __future__ import annotations
 
 import logging
-import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
-import asyncpg
+import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 # -- default seed data -------------------------------------------------------
@@ -37,10 +39,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS users (
-        tg_id BIGINT PRIMARY KEY,
+        tg_id INTEGER PRIMARY KEY,
         role TEXT NOT NULL DEFAULT 'client',
-        first_seen TIMESTAMP NOT NULL,
-        last_interaction TIMESTAMP NOT NULL,
+        first_seen DATETIME NOT NULL,
+        last_interaction DATETIME NOT NULL,
         total_visits INTEGER NOT NULL DEFAULT 0,
         preferred_name TEXT,
         phone TEXT,
@@ -48,13 +50,13 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         last_appointment_id INTEGER,
         tg_username TEXT,
         tg_first_name TEXT,
-        last_sleeping_ping TIMESTAMP,
+        last_sleeping_ping DATETIME,
         broadcast_opt_out INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS services (
-        id BIGSERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         price INTEGER NOT NULL,
         duration_minutes INTEGER NOT NULL,
@@ -63,7 +65,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS schedule (
-        id BIGSERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         day_of_week INTEGER NOT NULL UNIQUE,
         start_time TEXT NOT NULL,
         end_time TEXT NOT NULL,
@@ -72,30 +74,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS appointments (
-        id BIGSERIAL PRIMARY KEY,
-        client_tg_id BIGINT NOT NULL,
-        service_id BIGINT NOT NULL,
-        datetime TIMESTAMP NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_tg_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
+        datetime DATETIME NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
         actual_amount INTEGER,
-        created_at TIMESTAMP NOT NULL,
-        cancelled_at TIMESTAMP,
+        created_at DATETIME NOT NULL,
+        cancelled_at DATETIME,
         cancel_reason TEXT,
         client_phone TEXT,
         client_name TEXT,
-        reminder_sent INTEGER NOT NULL DEFAULT 0
+        reminder_sent INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY(service_id) REFERENCES services(id),
+        FOREIGN KEY(client_tg_id) REFERENCES users(tg_id)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS transactions (
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
         type TEXT NOT NULL,
         amount INTEGER NOT NULL,
         category TEXT NOT NULL DEFAULT '',
         comment TEXT NOT NULL DEFAULT '',
-        created_at TIMESTAMP NOT NULL,
-        appointment_id BIGINT,
+        created_at DATETIME NOT NULL,
+        appointment_id INTEGER,
         photo_file_id TEXT
     )
     """,
@@ -108,7 +112,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS welcome_texts (
-        id BIGSERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         type TEXT NOT NULL UNIQUE,
         text TEXT NOT NULL
     )
@@ -121,39 +125,43 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
     """
     CREATE TABLE IF NOT EXISTS client_notes (
-        tg_id BIGINT PRIMARY KEY,
+        tg_id INTEGER PRIMARY KEY,
         note TEXT NOT NULL DEFAULT '',
-        updated_at TIMESTAMP NOT NULL
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(tg_id) REFERENCES users(tg_id)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS client_tags (
-        tg_id BIGINT NOT NULL,
+        tg_id INTEGER NOT NULL,
         tag TEXT NOT NULL,
-        created_at TIMESTAMP NOT NULL,
-        PRIMARY KEY (tg_id, tag)
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (tg_id, tag),
+        FOREIGN KEY(tg_id) REFERENCES users(tg_id)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS waitlist (
-        id BIGSERIAL PRIMARY KEY,
-        client_tg_id BIGINT NOT NULL,
-        service_id BIGINT NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_tg_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
         target_date TEXT NOT NULL,
         target_time TEXT,
         client_name TEXT,
         client_phone TEXT,
-        created_at TIMESTAMP NOT NULL,
-        notified_at TIMESTAMP,
-        status TEXT NOT NULL DEFAULT 'waiting'
+        created_at DATETIME NOT NULL,
+        notified_at DATETIME,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        FOREIGN KEY(service_id) REFERENCES services(id),
+        FOREIGN KEY(client_tg_id) REFERENCES users(tg_id)
     )
     """,
     """
     CREATE TABLE IF NOT EXISTS broadcasts (
-        id BIGSERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         text TEXT NOT NULL,
         audience TEXT NOT NULL DEFAULT 'all',
-        created_at TIMESTAMP NOT NULL,
+        created_at DATETIME NOT NULL,
         sent_count INTEGER NOT NULL DEFAULT 0,
         failed_count INTEGER NOT NULL DEFAULT 0,
         kind TEXT NOT NULL DEFAULT 'manual'
@@ -173,7 +181,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
 USERS_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("tg_username", "TEXT"),
     ("tg_first_name", "TEXT"),
-    ("last_sleeping_ping", "TIMESTAMP"),
+    ("last_sleeping_ping", "DATETIME"),
     ("broadcast_opt_out", "INTEGER NOT NULL DEFAULT 0"),
 )
 
@@ -183,59 +191,24 @@ USERS_MIGRATIONS: tuple[tuple[str, str], ...] = (
 # ---------------------------------------------------------------------------
 
 
-def _now() -> datetime:
-    return datetime.now()
+def _now() -> str:
+    return datetime.now().strftime(DATETIME_FMT)
 
 
 def to_dt(value: str | datetime | None) -> datetime | None:
-    """Normalise a possibly-string datetime to a ``datetime`` object."""
     if value is None:
         return None
     if isinstance(value, datetime):
         return value
     try:
-        return datetime.fromisoformat(value)
+        return datetime.strptime(value, DATETIME_FMT)
     except ValueError:
-        return None
+        # SQLite may store sub-second precision in some cases.
+        return datetime.fromisoformat(value)
 
 
 def to_str(dt: datetime) -> str:
-    return dt.isoformat(sep=" ", timespec="seconds")
-
-
-# ``?`` → ``$N`` translation (single-pass, ignores placeholders inside literals)
-_PARAM_RE = re.compile(r"\?")
-
-
-def _translate(sql: str) -> str:
-    """Replace ``?`` placeholders with ``$1, $2, ...`` (skipping string literals)."""
-    out: list[str] = []
-    n = 1
-    in_squote = False
-    in_dquote = False
-    for ch in sql:
-        if ch == "'" and not in_dquote:
-            in_squote = not in_squote
-            out.append(ch)
-            continue
-        if ch == '"' and not in_squote:
-            in_dquote = not in_dquote
-            out.append(ch)
-            continue
-        if ch == "?" and not in_squote and not in_dquote:
-            out.append(f"${n}")
-            n += 1
-        else:
-            out.append(ch)
-    return "".join(out)
-
-
-_STATUS_RE = re.compile(r"\b(\d+)\s*$")
-
-
-def _parse_rowcount(status: str) -> int:
-    m = _STATUS_RE.search(status or "")
-    return int(m.group(1)) if m else 0
+    return dt.strftime(DATETIME_FMT)
 
 
 # ---------------------------------------------------------------------------
@@ -244,128 +217,85 @@ def _parse_rowcount(status: str) -> int:
 
 
 class Database:
-    """Async wrapper around an asyncpg pool with schema bootstrap."""
+    """Thin async wrapper around aiosqlite with schema bootstrap."""
 
-    def __init__(self, dsn: str) -> None:
-        self.dsn = dsn
-        self._pool: asyncpg.Pool | None = None
+    def __init__(self, path: Path | str) -> None:
+        self.path = str(path)
 
     async def init(self) -> None:
-        self._pool = await asyncpg.create_pool(
-            self.dsn,
-            min_size=1,
-            max_size=4,
-            command_timeout=30,
-        )
-        async with self._pool.acquire() as conn:
+        """Create tables, run column migrations, seed default rows."""
+        async with self.connect() as conn:
             for stmt in SCHEMA_STATEMENTS:
                 await conn.execute(stmt)
             await self._migrate_users(conn)
             await self._seed(conn)
-        logger.info("Database initialised (Postgres)")
+            await conn.commit()
+        logger.info("Database initialised at %s", self.path)
 
-    async def close(self) -> None:
-        if self._pool is not None:
-            await self._pool.close()
-            self._pool = None
-
-    async def _migrate_users(self, conn: asyncpg.Connection) -> None:
+    async def _migrate_users(self, conn: aiosqlite.Connection) -> None:
         """Add missing columns from USERS_MIGRATIONS (idempotent)."""
-        rows = await conn.fetch(
-            """
-            SELECT column_name FROM information_schema.columns
-             WHERE table_name = 'users'
-            """
-        )
-        existing = {row["column_name"] for row in rows}
+        cur = await conn.execute("PRAGMA table_info(users)")
+        existing = {row[1] for row in await cur.fetchall()}
         for col, ddl in USERS_MIGRATIONS:
             if col not in existing:
-                await conn.execute(
-                    f"ALTER TABLE users ADD COLUMN {col} {ddl}"
-                )
+                await conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
 
-    async def _seed(self, conn: asyncpg.Connection) -> None:
+    async def _seed(self, conn: aiosqlite.Connection) -> None:
+        # default settings
         for key, value in DEFAULT_SETTINGS.items():
             await conn.execute(
-                """
-                INSERT INTO settings(key, value) VALUES ($1, $2)
-                ON CONFLICT(key) DO NOTHING
-                """,
-                key, value,
+                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                (key, value),
             )
+        # default welcome texts
         await conn.execute(
-            """
-            INSERT INTO welcome_texts(type, text) VALUES ($1, $2)
-            ON CONFLICT(type) DO NOTHING
-            """,
-            "new", DEFAULT_WELCOME_NEW,
+            "INSERT OR IGNORE INTO welcome_texts(type, text) VALUES (?, ?)",
+            ("new", DEFAULT_WELCOME_NEW),
         )
         await conn.execute(
-            """
-            INSERT INTO welcome_texts(type, text) VALUES ($1, $2)
-            ON CONFLICT(type) DO NOTHING
-            """,
-            "returning", DEFAULT_WELCOME_RETURNING,
+            "INSERT OR IGNORE INTO welcome_texts(type, text) VALUES (?, ?)",
+            ("returning", DEFAULT_WELCOME_RETURNING),
         )
+        # master_info row id=1 always present (text empty until configured)
         await conn.execute(
-            """
-            INSERT INTO master_info(id, text, photo_file_id)
-            VALUES (1, '', NULL)
-            ON CONFLICT(id) DO NOTHING
-            """
+            "INSERT OR IGNORE INTO master_info(id, text, photo_file_id) VALUES (1, '', NULL)"
         )
 
     @asynccontextmanager
-    async def connect(self) -> AsyncIterator[asyncpg.Connection]:
-        assert self._pool is not None, "Database.init() must be awaited first"
-        async with self._pool.acquire() as conn:
+    async def connect(self) -> AsyncIterator[aiosqlite.Connection]:
+        conn = await aiosqlite.connect(self.path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA foreign_keys = ON")
+        try:
             yield conn
+        finally:
+            await conn.close()
 
     # -- low level helpers --------------------------------------------------
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> int:
-        """Run an INSERT/UPDATE/DELETE.
-
-        - If the SQL contains ``RETURNING ``, returns the first column of the
-          first row (typically an id).
-        - Otherwise returns 0.
-        """
-        sql = _translate(sql)
-        params = tuple(params)
         async with self.connect() as conn:
-            if " returning " in sql.lower():
-                val = await conn.fetchval(sql, *params)
-                return int(val) if val is not None else 0
-            await conn.execute(sql, *params)
-            return 0
-
-    async def execute_count(self, sql: str, params: Iterable[Any] = ()) -> int:
-        """Run an UPDATE/DELETE and return the affected rowcount."""
-        sql = _translate(sql)
-        params = tuple(params)
-        async with self.connect() as conn:
-            status = await conn.execute(sql, *params)
-            return _parse_rowcount(status)
+            cur = await conn.execute(sql, tuple(params))
+            await conn.commit()
+            return cur.lastrowid or 0
 
     async def fetchone(
         self, sql: str, params: Iterable[Any] = ()
-    ) -> asyncpg.Record | None:
-        sql = _translate(sql)
-        params = tuple(params)
+    ) -> aiosqlite.Row | None:
         async with self.connect() as conn:
-            return await conn.fetchrow(sql, *params)
+            cur = await conn.execute(sql, tuple(params))
+            return await cur.fetchone()
 
     async def fetchall(
         self, sql: str, params: Iterable[Any] = ()
-    ) -> list[asyncpg.Record]:
-        sql = _translate(sql)
-        params = tuple(params)
+    ) -> list[aiosqlite.Row]:
         async with self.connect() as conn:
-            return list(await conn.fetch(sql, *params))
+            cur = await conn.execute(sql, tuple(params))
+            return list(await cur.fetchall())
 
     # -- users --------------------------------------------------------------
 
-    async def get_user(self, tg_id: int) -> asyncpg.Record | None:
+    async def get_user(self, tg_id: int) -> aiosqlite.Row | None:
         return await self.fetchone("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
 
     async def upsert_user_visit(
@@ -375,7 +305,7 @@ class Database:
         *,
         username: str | None = None,
         first_name: str | None = None,
-    ) -> tuple[bool, asyncpg.Record]:
+    ) -> tuple[bool, aiosqlite.Row]:
         """Insert or update a user; return (is_new, row)."""
         existing = await self.get_user(tg_id)
         now = _now()
@@ -448,7 +378,6 @@ class Database:
             """
             INSERT INTO services(name, price, duration_minutes, description)
             VALUES (?, ?, ?, ?)
-            RETURNING id
             """,
             (name, price, duration_minutes, description),
         )
@@ -479,26 +408,24 @@ class Database:
         if not sets:
             return False
         vals.append(service_id)
-        return (
-            await self.execute_count(
+        async with self.connect() as conn:
+            cur = await conn.execute(
                 f"UPDATE services SET {', '.join(sets)} WHERE id = ?",
-                vals,
+                tuple(vals),
             )
-            > 0
-        )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def delete_service(self, service_id: int) -> bool:
-        return (
-            await self.execute_count(
-                "DELETE FROM services WHERE id = ?", (service_id,)
-            )
-            > 0
-        )
+        async with self.connect() as conn:
+            cur = await conn.execute("DELETE FROM services WHERE id = ?", (service_id,))
+            await conn.commit()
+            return cur.rowcount > 0
 
-    async def get_service(self, service_id: int) -> asyncpg.Record | None:
+    async def get_service(self, service_id: int) -> aiosqlite.Row | None:
         return await self.fetchone("SELECT * FROM services WHERE id = ?", (service_id,))
 
-    async def list_services(self) -> list[asyncpg.Record]:
+    async def list_services(self) -> list[aiosqlite.Row]:
         return await self.fetchall("SELECT * FROM services ORDER BY id")
 
     # -- schedule -----------------------------------------------------------
@@ -522,12 +449,12 @@ class Database:
             (day_of_week, start_time, end_time, break_minutes),
         )
 
-    async def get_schedule(self) -> list[asyncpg.Record]:
+    async def get_schedule(self) -> list[aiosqlite.Row]:
         return await self.fetchall(
             "SELECT * FROM schedule ORDER BY day_of_week"
         )
 
-    async def get_day_schedule(self, day_of_week: int) -> asyncpg.Record | None:
+    async def get_day_schedule(self, day_of_week: int) -> aiosqlite.Row | None:
         return await self.fetchone(
             "SELECT * FROM schedule WHERE day_of_week = ?", (day_of_week,)
         )
@@ -553,19 +480,18 @@ class Database:
                 client_tg_id, service_id, datetime, status, created_at,
                 client_name, client_phone
             ) VALUES (?, ?, ?, 'active', ?, ?, ?)
-            RETURNING id
             """,
             (
                 client_tg_id,
                 service_id,
-                dt,
+                to_str(dt),
                 _now(),
                 client_name,
                 client_phone,
             ),
         )
 
-    async def get_appointment(self, appt_id: int) -> asyncpg.Record | None:
+    async def get_appointment(self, appt_id: int) -> aiosqlite.Row | None:
         return await self.fetchone(
             """
             SELECT a.*, s.name AS service_name, s.price AS service_price,
@@ -577,7 +503,7 @@ class Database:
             (appt_id,),
         )
 
-    async def list_active_for_client(self, tg_id: int) -> list[asyncpg.Record]:
+    async def list_active_for_client(self, tg_id: int) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT a.*, s.name AS service_name, s.price AS service_price,
@@ -585,13 +511,13 @@ class Database:
               FROM appointments a
               JOIN services s ON s.id = a.service_id
              WHERE a.client_tg_id = ? AND a.status = 'active'
-               AND a.datetime >= ?
+               AND datetime(a.datetime) >= datetime(?)
              ORDER BY a.datetime
             """,
             (tg_id, _now()),
         )
 
-    async def list_upcoming(self) -> list[asyncpg.Record]:
+    async def list_upcoming(self) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT a.*, s.name AS service_name, s.price AS service_price,
@@ -599,13 +525,13 @@ class Database:
               FROM appointments a
               JOIN services s ON s.id = a.service_id
              WHERE a.status = 'active'
-               AND a.datetime >= ?
+               AND datetime(a.datetime) >= datetime(?)
              ORDER BY a.datetime
             """,
             (_now(),),
         )
 
-    async def list_active_for_day(self, day: datetime) -> list[asyncpg.Record]:
+    async def list_active_for_day(self, day: datetime) -> list[aiosqlite.Row]:
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         return await self.fetchall(
@@ -614,19 +540,19 @@ class Database:
               FROM appointments a
               JOIN services s ON s.id = a.service_id
              WHERE a.status = 'active'
-               AND a.datetime >= ?
-               AND a.datetime <  ?
+               AND datetime(a.datetime) >= datetime(?)
+               AND datetime(a.datetime) <  datetime(?)
              ORDER BY a.datetime
             """,
-            (start, end),
+            (to_str(start), to_str(end)),
         )
 
     async def cancel_appointment(
         self, appt_id: int, reason: str | None, mark_rescheduled: bool = False
     ) -> bool:
         status = "rescheduled" if mark_rescheduled else "cancelled"
-        return (
-            await self.execute_count(
+        async with self.connect() as conn:
+            cur = await conn.execute(
                 """
                 UPDATE appointments
                    SET status = ?, cancelled_at = ?, cancel_reason = ?
@@ -634,14 +560,14 @@ class Database:
                 """,
                 (status, _now(), reason, appt_id),
             )
-            > 0
-        )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def complete_appointment(
         self, appt_id: int, actual_amount: int
     ) -> bool:
-        return (
-            await self.execute_count(
+        async with self.connect() as conn:
+            cur = await conn.execute(
                 """
                 UPDATE appointments
                    SET status = 'completed', actual_amount = ?
@@ -649,8 +575,8 @@ class Database:
                 """,
                 (actual_amount, appt_id),
             )
-            > 0
-        )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def mark_reminder_sent(self, appt_id: int) -> None:
         await self.execute(
@@ -660,7 +586,7 @@ class Database:
 
     async def appointments_for_reminders(
         self, window_start: datetime, window_end: datetime
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT a.*, s.name AS service_name, s.duration_minutes AS service_duration
@@ -668,10 +594,10 @@ class Database:
               JOIN services s ON s.id = a.service_id
              WHERE a.status = 'active'
                AND a.reminder_sent = 0
-               AND a.datetime >= ?
-               AND a.datetime <  ?
+               AND datetime(a.datetime) >= datetime(?)
+               AND datetime(a.datetime) <  datetime(?)
             """,
-            (window_start, window_end),
+            (to_str(window_start), to_str(window_end)),
         )
 
     async def appointments_in_period(
@@ -679,17 +605,17 @@ class Database:
         period_start: datetime,
         period_end: datetime,
         status: str | None = None,
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         sql = (
             """
             SELECT a.*, s.name AS service_name, s.price AS service_price
               FROM appointments a
               JOIN services s ON s.id = a.service_id
-             WHERE a.datetime >= ?
-               AND a.datetime <  ?
+             WHERE datetime(a.datetime) >= datetime(?)
+               AND datetime(a.datetime) <  datetime(?)
             """
         )
-        params: list[Any] = [period_start, period_end]
+        params: list[Any] = [to_str(period_start), to_str(period_end)]
         if status is not None:
             sql += " AND a.status = ?"
             params.append(status)
@@ -714,7 +640,6 @@ class Database:
                 user_id, type, amount, category, comment, created_at,
                 appointment_id, photo_file_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
             """,
             (
                 user_id,
@@ -730,20 +655,20 @@ class Database:
 
     async def transactions_in_period(
         self, start: datetime, end: datetime
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT * FROM transactions
-             WHERE created_at >= ?
-               AND created_at <  ?
+             WHERE datetime(created_at) >= datetime(?)
+               AND datetime(created_at) <  datetime(?)
              ORDER BY created_at
             """,
-            (start, end),
+            (to_str(start), to_str(end)),
         )
 
     # -- master info --------------------------------------------------------
 
-    async def get_master_info(self) -> asyncpg.Record | None:
+    async def get_master_info(self) -> aiosqlite.Row | None:
         return await self.fetchone("SELECT * FROM master_info WHERE id = 1")
 
     async def set_master_info(
@@ -809,7 +734,7 @@ class Database:
         sleeping_days: int | None = None,
         top_spenders_only: bool = False,
         with_tag: str | None = None,
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         """Return clients with aggregated visit/spending data and tag list."""
         params: list[Any] = [only_role]
         sql = """
@@ -830,7 +755,7 @@ class Database:
                     AS cancelled_visits,
                 MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
                     AS last_visit_dt,
-                (SELECT STRING_AGG(t.tag, ',')
+                (SELECT GROUP_CONCAT(t.tag, ',')
                    FROM client_tags t WHERE t.tg_id = u.tg_id) AS tags_csv
               FROM users u
               LEFT JOIN appointments a ON a.client_tg_id = u.tg_id
@@ -845,18 +770,17 @@ class Database:
         sql += " GROUP BY u.tg_id"
         if sleeping_days is not None:
             sql += (
-                " HAVING (MAX(CASE WHEN a.status = 'completed' THEN a.datetime END) IS NULL"
-                "         OR MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)"
-                "            <= ? - INTERVAL '1 day' * ?)"
+                " HAVING (last_visit_dt IS NULL"
+                "         OR datetime(last_visit_dt) <= datetime(?, ?))"
             )
-            params.extend([_now(), int(sleeping_days)])
+            params.extend([_now(), f"-{int(sleeping_days)} days"])
         if top_spenders_only:
             sql += " ORDER BY total_spent DESC, completed_visits DESC"
         else:
-            sql += " ORDER BY u.last_interaction DESC"
+            sql += " ORDER BY datetime(u.last_interaction) DESC"
         return await self.fetchall(sql, params)
 
-    async def get_client_history(self, tg_id: int) -> list[asyncpg.Record]:
+    async def get_client_history(self, tg_id: int) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT a.*, s.name AS service_name, s.price AS service_price
@@ -888,36 +812,33 @@ class Database:
             """,
             (tg_id,),
         )
-        if row is None:
-            return {
-                "total_spent": 0, "completed": 0, "cancelled": 0,
-                "rescheduled": 0, "last_visit_dt": None,
-            }
-        return dict(row)
+        return dict(row) if row else {
+            "total_spent": 0, "completed": 0, "cancelled": 0,
+            "rescheduled": 0, "last_visit_dt": None,
+        }
 
     # -- CRM: tags & notes --------------------------------------------------
 
     async def add_client_tag(self, tg_id: int, tag: str) -> bool:
-        return (
-            await self.execute_count(
+        async with self.connect() as conn:
+            cur = await conn.execute(
                 """
-                INSERT INTO client_tags(tg_id, tag, created_at)
+                INSERT OR IGNORE INTO client_tags(tg_id, tag, created_at)
                 VALUES (?, ?, ?)
-                ON CONFLICT(tg_id, tag) DO NOTHING
                 """,
                 (tg_id, tag, _now()),
             )
-            > 0
-        )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def remove_client_tag(self, tg_id: int, tag: str) -> bool:
-        return (
-            await self.execute_count(
+        async with self.connect() as conn:
+            cur = await conn.execute(
                 "DELETE FROM client_tags WHERE tg_id = ? AND tag = ?",
                 (tg_id, tag),
             )
-            > 0
-        )
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def get_client_tags(self, tg_id: int) -> list[str]:
         rows = await self.fetchall(
@@ -962,7 +883,6 @@ class Database:
                 client_tg_id, service_id, target_date, target_time,
                 client_name, client_phone, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            RETURNING id
             """,
             (
                 client_tg_id, service_id, target_date, target_time,
@@ -972,7 +892,7 @@ class Database:
 
     async def list_waitlist_for_slot(
         self, *, service_id: int, target_date: str
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT w.*, s.name AS service_name, s.duration_minutes AS service_duration
@@ -988,7 +908,7 @@ class Database:
 
     async def list_active_waitlist_for_client(
         self, client_tg_id: int
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT w.*, s.name AS service_name
@@ -1000,7 +920,7 @@ class Database:
             (client_tg_id,),
         )
 
-    async def get_waitlist_entry(self, entry_id: int) -> asyncpg.Record | None:
+    async def get_waitlist_entry(self, entry_id: int) -> aiosqlite.Row | None:
         return await self.fetchone(
             """
             SELECT w.*, s.name AS service_name, s.price AS service_price,
@@ -1026,7 +946,7 @@ class Database:
                 (status, entry_id),
             )
 
-    async def list_all_waitlist(self) -> list[asyncpg.Record]:
+    async def list_all_waitlist(self) -> list[aiosqlite.Row]:
         return await self.fetchall(
             """
             SELECT w.*, s.name AS service_name
@@ -1041,7 +961,7 @@ class Database:
 
     async def list_broadcast_audience(
         self, audience: str
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         """Return user rows for a given audience selection."""
         if audience == "sleeping30":
             return await self.fetchall(
@@ -1052,9 +972,8 @@ class Database:
                   LEFT JOIN appointments a ON a.client_tg_id = u.tg_id
                  WHERE u.role = 'client' AND COALESCE(u.broadcast_opt_out, 0) = 0
                  GROUP BY u.tg_id
-                HAVING (MAX(CASE WHEN a.status = 'completed' THEN a.datetime END) IS NULL
-                        OR MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
-                           <= ? - INTERVAL '30 days')
+                HAVING (last_visit_dt IS NULL
+                        OR datetime(last_visit_dt) <= datetime(?, '-30 days'))
                 """,
                 (_now(),),
             )
@@ -1089,7 +1008,6 @@ class Database:
             """
             INSERT INTO broadcasts(text, audience, created_at, sent_count, failed_count, kind)
             VALUES (?, ?, ?, ?, ?, ?)
-            RETURNING id
             """,
             (text, audience, _now(), sent, failed, kind),
         )
@@ -1102,7 +1020,7 @@ class Database:
 
     async def list_sleeping_for_auto_ping(
         self, *, days: int = 30, cooldown_days: int = 30
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         """Sleeping clients we haven't pinged in the last cooldown_days."""
         return await self.fetchall(
             """
@@ -1113,15 +1031,14 @@ class Database:
              WHERE u.role = 'client'
                AND COALESCE(u.broadcast_opt_out, 0) = 0
              GROUP BY u.tg_id
-            HAVING MAX(CASE WHEN a.status = 'completed' THEN a.datetime END) IS NOT NULL
-               AND MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
-                   <= ? - INTERVAL '1 day' * ?
+            HAVING last_visit_dt IS NOT NULL
+               AND datetime(last_visit_dt) <= datetime(?, ?)
                AND (u.last_sleeping_ping IS NULL
-                    OR u.last_sleeping_ping <= ? - INTERVAL '1 day' * ?)
+                    OR datetime(u.last_sleeping_ping) <= datetime(?, ?))
             """,
             (
-                _now(), int(days),
-                _now(), int(cooldown_days),
+                _now(), f"-{int(days)} days",
+                _now(), f"-{int(cooldown_days)} days",
             ),
         )
 
@@ -1129,7 +1046,7 @@ class Database:
 
     async def analytics_top_services(
         self, since: datetime | None = None, limit: int = 5
-    ) -> list[asyncpg.Record]:
+    ) -> list[aiosqlite.Row]:
         params: list[Any] = []
         sql = """
             SELECT s.id, s.name,
@@ -1142,27 +1059,27 @@ class Database:
               LEFT JOIN appointments a ON a.service_id = s.id
         """
         if since is not None:
-            sql += " AND a.datetime >= ?"
-            params.append(since)
-        sql += " GROUP BY s.id, s.name ORDER BY visits DESC, revenue DESC LIMIT ?"
+            sql += " AND datetime(a.datetime) >= datetime(?)"
+            params.append(to_str(since))
+        sql += " GROUP BY s.id ORDER BY visits DESC, revenue DESC LIMIT ?"
         params.append(limit)
         return await self.fetchall(sql, params)
 
     async def analytics_busy_heatmap(
         self, since: datetime | None = None
-    ) -> list[asyncpg.Record]:
-        """(weekday 0-6 Sun-based, hour 0-23, count) of completed/active appointments."""
+    ) -> list[aiosqlite.Row]:
+        """(weekday 0-6, hour 0-23, count) of completed/active appointments."""
         params: list[Any] = []
         sql = """
-            SELECT CAST(EXTRACT(DOW FROM datetime) AS INT) AS weekday_sun0,
-                   CAST(EXTRACT(HOUR FROM datetime) AS INT) AS hour,
+            SELECT CAST(strftime('%w', datetime) AS INT) AS weekday_sun0,
+                   CAST(strftime('%H', datetime) AS INT) AS hour,
                    COUNT(*) AS cnt
               FROM appointments
              WHERE status IN ('active','completed')
         """
         if since is not None:
-            sql += " AND datetime >= ?"
-            params.append(since)
+            sql += " AND datetime(datetime) >= datetime(?)"
+            params.append(to_str(since))
         sql += " GROUP BY weekday_sun0, hour"
         return await self.fetchall(sql, params)
 
@@ -1172,8 +1089,8 @@ class Database:
         params: list[Any] = []
         where = ""
         if since is not None:
-            where = " WHERE created_at >= ?"
-            params.append(since)
+            where = " WHERE datetime(created_at) >= datetime(?)"
+            params.append(to_str(since))
         row = await self.fetchone(
             f"""
             SELECT
@@ -1187,9 +1104,7 @@ class Database:
             """,
             params,
         )
-        if row is None:
-            return {
-                "bookings": 0, "completed": 0, "cancelled": 0,
-                "rescheduled": 0, "active": 0,
-            }
-        return dict(row)
+        return dict(row) if row else {
+            "bookings": 0, "completed": 0, "cancelled": 0,
+            "rescheduled": 0, "active": 0,
+        }

@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging(str(settings.log_path))
     log = logging.getLogger("beauty-bot")
 
-    db = Database(settings.database_url)
+    db = Database(settings.db_path)
     await db.init()
 
     bot = Bot(
@@ -117,7 +117,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception:  # noqa: BLE001
             pass
         scheduler.shutdown(wait=False)
-        await db.close()
         await bot.session.close()
 
 

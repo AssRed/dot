@@ -40,7 +40,7 @@ async def main() -> None:
     setup_logging(str(settings.log_path))
     log = logging.getLogger(__name__)
 
-    db = Database(settings.database_url)
+    db = Database(settings.db_path)
     await db.init()
 
     bot = Bot(
@@ -77,7 +77,6 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown(wait=False)
-        await db.close()
         await bot.session.close()
 
 

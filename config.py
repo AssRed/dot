@@ -16,7 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 class Settings:
     bot_token: str
     master_tg_id: int
-    database_url: str
+    db_path: Path
     tz: str
     log_path: Path
 
@@ -38,18 +38,9 @@ class Settings:
         except ValueError as exc:
             raise RuntimeError("MASTER_TG_ID must be an integer") from exc
 
-        database_url = os.getenv("DATABASE_URL", "").strip()
-        if not database_url:
-            raise RuntimeError(
-                "DATABASE_URL is not set. Use a Postgres connection string "
-                "(postgres://user:pass@host/db?sslmode=require)."
-            )
-        # asyncpg expects a libpq-style URL but does not support `?sslmode=...`
-        # query parameter directly; we keep the URL as-is (asyncpg honours
-        # `sslmode=require` for managed providers like Neon when forwarded).
-        if database_url.startswith("postgresql+"):
-            # SQLAlchemy-style → strip dialect suffix.
-            database_url = "postgresql://" + database_url.split("://", 1)[1]
+        db_path = Path(os.getenv("DB_PATH", "bot.db"))
+        if not db_path.is_absolute():
+            db_path = BASE_DIR / db_path
 
         tz = os.getenv("TZ", "Europe/Moscow")
         log_path = BASE_DIR / "bot.log"
@@ -57,7 +48,7 @@ class Settings:
         return cls(
             bot_token=token,
             master_tg_id=master_id,
-            database_url=database_url,
+            db_path=db_path,
             tz=tz,
             log_path=log_path,
         )

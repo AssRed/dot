@@ -71,7 +71,7 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 
 - Python 3.10+ (рекомендуется 3.11)
 - [aiogram 3](https://docs.aiogram.dev/) — асинхронный фреймворк для Telegram.
-- [asyncpg](https://magicstack.github.io/asyncpg/) — асинхронный драйвер PostgreSQL.
+- [aiosqlite](https://github.com/omnilib/aiosqlite) — асинхронный SQLite-драйвер.
 - [APScheduler](https://apscheduler.readthedocs.io/) — напоминания.
 - [openpyxl](https://openpyxl.readthedocs.io/) — Excel-отчёты.
 - [python-dotenv](https://pypi.org/project/python-dotenv/) — конфигурация.
@@ -94,12 +94,35 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 │   ├── forecast.py
 │   └── report.py
 ├── requirements.txt
-├── Procfile
-├── railway.json
+├── start.bat            # одноклик-запуск под Windows
 └── .env.example
 ```
 
-## Локальный запуск
+## Быстрый запуск под Windows (без облаков)
+
+1. Установите Python 3.11 с https://www.python.org/downloads/.
+   На первом экране установщика обязательно поставьте галочку
+   **«Add Python to PATH»**.
+2. Скачайте проект ZIP-архивом
+   (https://github.com/AssRed/dot/archive/refs/heads/devin/1777743135-bootstrap-bot.zip)
+   и распакуйте куда удобно (например, на Рабочий стол).
+3. Двойной клик по `start.bat`.
+   - При первом запуске откроется Блокнот с файлом `.env`. Заполните
+     `BOT_TOKEN` (от `@BotFather`) и `MASTER_TG_ID` (узнать у `@userinfobot`),
+     сохраните, закройте Блокнот, нажмите любую клавишу.
+   - Скрипт сам создаст виртуальное окружение, установит зависимости
+     и запустит бота.
+4. Когда увидите строку `Bot started` — бот живой. В Telegram откройте
+   своего бота и отправьте `/start`.
+
+База данных живёт в файле `bot.db` рядом с программой — никакие облака
+и регистрации не нужны. Бот работает, пока открыто чёрное окно.
+
+> Чтобы бот работал постоянно — держите ноутбук подключённым к питанию,
+> а в настройках Windows → Электропитание поставьте «Сон → Никогда» (хотя бы
+> при работе от сети).
+
+## Локальный запуск (Linux / macOS)
 
 1. Установите Python 3.10+.
 2. Клонируйте репозиторий и установите зависимости:
@@ -108,14 +131,8 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-3. Создайте `.env` на основе `.env.example`:
-   ```
-   BOT_TOKEN=токен_от_BotFather
-   MASTER_TG_ID=ваш_telegram_id
-   DATABASE_URL=postgresql://user:password@host/db?sslmode=require
-   ```
-   - Telegram ID можно узнать у `@userinfobot`.
-   - Бесплатный Postgres: [Neon](https://neon.tech) (без карты), Supabase, Railway.
+3. Скопируйте `.env.example` в `.env` и заполните `BOT_TOKEN` и
+   `MASTER_TG_ID`.
 4. Запустите:
    ```bash
    python main.py
@@ -135,53 +152,22 @@ Telegram-бот на **aiogram 3** для одного бьюти-мастера
 
 После этого можно делиться ссылкой на бота с клиентами.
 
-## Деплой
+## Бэкап базы
 
-Подходит любой контейнерный хост, поддерживающий `Dockerfile`. Бот
-работает в **webhook-режиме** через FastAPI (`app:app`), поэтому хост
-может усыпать инстанс при простое — Telegram разбудит его новым
-update'ом.
+База — файл `bot.db` рядом с программой. Чтобы сделать резервную копию,
+просто скопируйте `bot.db` в безопасное место (Яндекс.Диск, флешка, e-mail
+самому себе). Восстановление — положить файл назад и запустить бота.
 
-### Render (бесплатный, без карты)
-1. https://dashboard.render.com → **New +** → **Web Service**.
-2. **Connect a repository** → выбрать `AssRed/dot`.
-3. Settings:
-   - **Name**: `beauty-master-bot` (URL будет `https://beauty-master-bot.onrender.com`).
-   - **Region**: `Frankfurt` или `Oregon`.
-   - **Branch**: `devin/1777743135-bootstrap-bot`.
-   - **Runtime**: `Docker` (auto-detected по `Dockerfile`).
-   - **Instance Type**: `Free`.
-4. Environment variables:
-   - `BOT_TOKEN`
-   - `MASTER_TG_ID`
-   - `DATABASE_URL` (Postgres URL от [Neon](https://neon.tech))
-   - `WEBHOOK_BASE_URL=https://beauty-master-bot.onrender.com`
-   - (опционально) `TZ=Europe/Moscow`
-5. **Create Web Service** → подождать ~3 мин до `Live`.
+## Логи
 
-> Free Web Service на Render засыпает после 15 мин простоя; первый запрос после сна
-> занимает ~30 сек, но Telegram повторит webhook, так что сообщения не теряются.
+Все события пишутся в `bot.log` (ротация по 1 МБ, 3 файла) и в окно
+консоли. Если бот ведёт себя странно — посмотрите в `bot.log`.
 
-### Koyeb (бесплатный nano)
-1. https://app.koyeb.com → **Create Service** → **GitHub** → выбрать репозиторий.
-2. Build: **Dockerfile** (auto-detected).
-3. Region: `was` или `fra`. Instance: `Eco/Free`.
-4. Environment variables:
-   - `BOT_TOKEN`
-   - `MASTER_TG_ID`
-   - `DATABASE_URL` (Postgres URL, например от [Neon](https://neon.tech))
-   - `WEBHOOK_BASE_URL=https://<your-app>.koyeb.app`
-   - (опционально) `TZ=Europe/Moscow`
-5. Health check: HTTP GET `/health` на порту `8080`.
+## Деплой на VPS (опционально, для 24/7)
 
-### Fly.io
-```bash
-fly secrets set BOT_TOKEN=... MASTER_TG_ID=... DATABASE_URL=...
-fly deploy
-```
-Webhook URL подхватывается автоматически из `FLY_APP_NAME`.
-
-## Деплой на VPS (systemd)
+Если вам нужно, чтобы бот работал постоянно даже при выключенном ноутбуке —
+аренда VPS у российского провайдера (Beget, Timeweb, Reg.ru) от ~150 ₽/мес.
+Пример unit-файла systemd:
 
 ```ini
 # /etc/systemd/system/beauty-bot.service
@@ -205,10 +191,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now beauty-bot
 journalctl -u beauty-bot -f
 ```
-
-## Логи
-
-Все события пишутся в `bot.log` (ротация по 1 МБ, 3 файла) и в stdout.
 
 ## Лицензия
 
