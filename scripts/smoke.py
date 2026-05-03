@@ -13,7 +13,7 @@ import asyncio
 import os
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # Make the project root importable when run from anywhere.
@@ -109,6 +109,46 @@ async def _run() -> None:
         ok = await db.cancel_appointment(appt2, "test")
         assert ok
         print("[ok] cancellation works")
+
+        # ------- new feature smoke (#6/#8/#9/#11/#12) -------
+        await db.upsert_user_visit(99001, role="client", username="test_user", first_name="Ann")
+        await db.upsert_user_visit(99002, role="client", username="vip_user", first_name="Bee")
+        await db.add_client_tag(99001, "VIP")
+        await db.set_client_note(99001, "любит ромашковый чай")
+        clients = await db.list_clients()
+        assert any(int(r["tg_id"]) == 99001 for r in clients)
+        vip_only = await db.list_clients(with_tag="VIP")
+        assert len(vip_only) >= 1
+        print(f"[ok] CRM: {len(clients)} clients listed, vip filter ok")
+
+        wl_id = await db.add_to_waitlist(
+            client_tg_id=99001,
+            service_id=sid,
+            target_date=date.today().isoformat(),
+            target_time=None,
+            client_name="Ann",
+            client_phone="+79990001111",
+        )
+        wl = await db.list_all_waitlist()
+        assert any(int(r["id"]) == wl_id for r in wl)
+        await db.update_waitlist_status(wl_id, "fulfilled")
+        print("[ok] waitlist add+list+update works")
+
+        bc_audience = await db.list_broadcast_audience("all")
+        assert isinstance(bc_audience, list)
+        await db.record_broadcast(text="hi", audience="all", sent=1, failed=0, kind="manual")
+        print(f"[ok] broadcasts: audience size={len(bc_audience)}")
+
+        top = await db.analytics_top_services(limit=3)
+        heat = await db.analytics_busy_heatmap()
+        funnel = await db.analytics_funnel()
+        assert isinstance(top, list)
+        assert isinstance(heat, list)
+        assert "bookings" in funnel
+        print(
+            f"[ok] analytics: top={len(top)} heatmap_cells={len(heat)} "
+            f"bookings={funnel.get('bookings')}"
+        )
 
     print("\nALL SMOKE CHECKS PASSED")
 

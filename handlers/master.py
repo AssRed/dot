@@ -19,6 +19,7 @@ from config import Settings
 from database import Database, to_dt
 from utils.forecast import build_forecast
 from utils.report import build_excel_report, summarise
+from utils.waitlist import notify_waitlist_for_freed_slot
 
 logger = logging.getLogger(__name__)
 router = Router(name="master")
@@ -506,8 +507,19 @@ async def master_cancel(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to notify client about cancel: %s", exc)
+    if appt_dt is not None:
+        notified = await notify_waitlist_for_freed_slot(
+            bot=bot, db=db, service_id=int(appt["service_id"]), freed_dt=appt_dt
+        )
+    else:
+        notified = 0
+    suffix = (
+        f"\nИз очереди ожидания уведомлено: {notified}."
+        if notified
+        else ""
+    )
     await call.message.edit_text(
-        f"Запись #{appt_id} отменена. Клиенту отправлено уведомление."
+        f"Запись #{appt_id} отменена. Клиенту отправлено уведомление.{suffix}"
     )
     await call.answer()
 
@@ -1056,3 +1068,531 @@ async def welcome_save(
     await db.set_welcome_text(data["welcome_type"], message.text)
     await state.clear()
     await message.answer("Приветствие обновлено ✅")
+
+
+# =====================================================================
+# Mini-landing (#6) — deep-link to a booking-ready start screen
+# =====================================================================
+
+
+@router.message(Command("landing"))
+async def landing_cmd(
+    message: Message, bot: Bot, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    me = await bot.get_me()
+    username = me.username
+    if not username:
+        await message.answer("У бота нет username — добавьте его через BotFather.")
+        return
+    link = f"https://t.me/{username}?start=master"
+    await message.answer(
+        "🌐 <b>Мини-лендинг</b>\n\n"
+        "Поделитесь этой ссылкой в Instagram, TikTok, визитках и на сайте — "
+        "клиент откроет бота с готовым приветствием и кнопкой «Записаться»:\n\n"
+        f"<code>{link}</code>\n\n"
+        "Совет: добавьте сюда свежий кейс или акцию через <code>/set_master_info</code> — "
+        "это первое, что увидит клиент."
+    )
+
+
+# =====================================================================
+# CRM (#8) — клиентская база, теги, заметки
+# =====================================================================
+
+
+class NoteFlow(StatesGroup):
+    waiting_text = State()
+
+
+def _client_label(row) -> str:
+    name = (
+        row["preferred_name"]
+        or row["tg_first_name"]
+        or (f"@{row['tg_username']}" if row["tg_username"] else None)
+        or f"id{row['tg_id']}"
+    )
+    return name
+
+
+def _format_filter_title(filt: str) -> str:
+    return {
+        "recent": "👥 Все клиенты",
+        "sleeping": "😴 Спящие 30+ дней",
+        "top": "💎 Топ по тратам",
+        "vip": "⭐ VIP-клиенты",
+    }.get(filt, "👥 Все клиенты")
+
+
+async def _list_clients_for_filter(db: Database, filt: str):
+    if filt == "sleeping":
+        return await db.list_clients(sleeping_days=30)
+    if filt == "top":
+        return await db.list_clients(top_spenders_only=True)
+    if filt == "vip":
+        return await db.list_clients(with_tag="VIP")
+    return await db.list_clients()
+
+
+def _format_clients_block(rows: list, *, limit: int = 20) -> str:
+    if not rows:
+        return "Пока пусто.\n\nКак только клиент впервые напишет боту — он появится здесь."
+    lines: list[str] = []
+    for r in rows[:limit]:
+        last_visit = to_dt(r["last_visit_dt"]) if r["last_visit_dt"] else None
+        last_str = last_visit.strftime("%d.%m.%Y") if last_visit else "—"
+        tags = (r["tags_csv"] or "").strip()
+        tag_line = f" · 🏷 {tags}" if tags else ""
+        spent = int(r["total_spent"] or 0)
+        visits = int(r["completed_visits"] or 0)
+        lines.append(
+            f"<b>{_client_label(r)}</b>\n"
+            f"  /client_{int(r['tg_id'])} · 💰 {spent}₽ · "
+            f"визитов {visits} · посл. {last_str}{tag_line}"
+        )
+    if len(rows) > limit:
+        lines.append(f"\n…и ещё {len(rows) - limit} клиентов.")
+    return "\n\n".join(lines)
+
+
+@router.message(Command("clients"))
+async def clients_cmd(
+    message: Message, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    rows = await _list_clients_for_filter(db, "recent")
+    body = (
+        f"<b>{_format_filter_title('recent')}</b>\n"
+        f"Всего: {len(rows)}\n\n"
+        + _format_clients_block(rows)
+    )
+    await message.answer(body, reply_markup=kb.clients_filter_kb("recent"))
+
+
+@router.callback_query(F.data.startswith("crm:filter:"))
+async def crm_filter(
+    call: CallbackQuery, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.message is None or call.data is None:
+        return
+    filt = call.data.split(":")[2]
+    rows = await _list_clients_for_filter(db, filt)
+    body = (
+        f"<b>{_format_filter_title(filt)}</b>\n"
+        f"Всего: {len(rows)}\n\n"
+        + _format_clients_block(rows)
+    )
+    try:
+        await call.message.edit_text(body, reply_markup=kb.clients_filter_kb(filt))
+    except Exception:
+        await call.message.answer(body, reply_markup=kb.clients_filter_kb(filt))
+    await call.answer()
+
+
+async def _send_client_card(
+    target: Message, db: Database, tg_id: int
+) -> None:
+    user = await db.get_user(tg_id)
+    if user is None:
+        await target.answer("Клиент не найден.")
+        return
+    summary = await db.client_summary(tg_id)
+    tags = await db.get_client_tags(tg_id)
+    note = await db.get_client_note(tg_id)
+    history = await db.get_client_history(tg_id)
+    last_visit = to_dt(summary.get("last_visit_dt")) if summary.get("last_visit_dt") else None
+
+    name = (
+        user["preferred_name"]
+        or user["tg_first_name"]
+        or (f"@{user['tg_username']}" if user["tg_username"] else None)
+        or f"id{tg_id}"
+    )
+    handle_line = f"@{user['tg_username']}\n" if user["tg_username"] else ""
+    phone_line = f"📞 {user['phone']}\n" if user["phone"] else ""
+    tags_line = "🏷 " + (", ".join(tags) if tags else "—")
+    note_line = f"📝 {note}\n" if note else "📝 заметок нет\n"
+    last_str = last_visit.strftime("%d.%m.%Y") if last_visit else "никогда"
+
+    body = (
+        f"👤 <b>{name}</b>\n"
+        f"{handle_line}{phone_line}"
+        f"💰 Потратил: {int(summary.get('total_spent', 0))}₽\n"
+        f"✅ Завершено: {summary.get('completed', 0) or 0} · "
+        f"❌ Отмен: {summary.get('cancelled', 0) or 0} · "
+        f"🔁 Переносов: {summary.get('rescheduled', 0) or 0}\n"
+        f"📅 Последний визит: {last_str}\n"
+        f"📜 Всего записей: {len(history)}\n\n"
+        f"{tags_line}\n"
+        f"{note_line}"
+    )
+    await target.answer(body, reply_markup=kb.client_card_kb(tg_id, tags=tags))
+
+
+@router.message(Command("client"))
+async def client_card_cmd(
+    message: Message, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().lstrip("-").isdigit():
+        await message.answer("Использование: /client &lt;tg_id&gt;")
+        return
+    tg_id = int(parts[1].strip())
+    await _send_client_card(message, db, tg_id)
+
+
+@router.message(F.text.regexp(r"^/client_(\d+)$"))
+async def client_card_shortcut(
+    message: Message, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    if not message.text:
+        return
+    tg_id = int(message.text.split("_", 1)[1])
+    await _send_client_card(message, db, tg_id)
+
+
+@router.callback_query(F.data.startswith("crm:tag:"))
+async def crm_toggle_tag(
+    call: CallbackQuery, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.data is None or call.message is None:
+        return
+    parts = call.data.split(":", 3)
+    tg_id = int(parts[2])
+    tag = parts[3]
+    tags = await db.get_client_tags(tg_id)
+    if tag in tags:
+        await db.remove_client_tag(tg_id, tag)
+        await call.answer(f"Тег «{tag}» снят")
+    else:
+        await db.add_client_tag(tg_id, tag)
+        await call.answer(f"Тег «{tag}» добавлен")
+    await _send_client_card(call.message, db, tg_id)
+
+
+@router.callback_query(F.data.startswith("crm:note:"))
+async def crm_note_start(
+    call: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.data is None or call.message is None:
+        return
+    tg_id = int(call.data.split(":")[2])
+    await state.set_state(NoteFlow.waiting_text)
+    await state.update_data(crm_note_tg_id=tg_id)
+    await call.message.answer(
+        "Пришлите заметку про клиента (предпочтения, аллергии, любимые услуги). "
+        "«-» — очистить заметку. /cancel — отмена."
+    )
+    await call.answer()
+
+
+@router.message(NoteFlow.waiting_text)
+async def crm_note_save(
+    message: Message, state: FSMContext, db: Database
+) -> None:
+    raw = (message.text or "").strip()
+    data = await state.get_data()
+    tg_id = int(data["crm_note_tg_id"])
+    await state.clear()
+    note = "" if raw == "-" else raw[:1000]
+    await db.set_client_note(tg_id, note)
+    await message.answer("Заметка сохранена ✅")
+    await _send_client_card(message, db, tg_id)
+
+
+@router.callback_query(F.data.startswith("crm:hist:"))
+async def crm_history(
+    call: CallbackQuery, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.data is None or call.message is None:
+        return
+    tg_id = int(call.data.split(":")[2])
+    history = await db.get_client_history(tg_id)
+    if not history:
+        await call.message.answer("История визитов пуста.")
+        await call.answer()
+        return
+    status_label = {
+        "completed": "✅",
+        "active": "📅",
+        "cancelled": "❌",
+        "rescheduled": "🔁",
+    }
+    lines = ["<b>📜 История клиента</b>"]
+    for row in history[:20]:
+        appt_dt = to_dt(row["datetime"])
+        when = appt_dt.strftime("%d.%m.%Y %H:%M") if appt_dt else "—"
+        marker = status_label.get(row["status"], "•")
+        sum_part = ""
+        if row["status"] == "completed":
+            amount = row["actual_amount"] if row["actual_amount"] is not None else row["service_price"]
+            sum_part = f" · {amount}₽"
+        lines.append(f"{marker} {when} — {row['service_name']}{sum_part}")
+    if len(history) > 20:
+        lines.append(f"\n…и ещё {len(history) - 20} записей.")
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+# =====================================================================
+# Broadcasts (#9) — рассылки
+# =====================================================================
+
+
+class BroadcastFlow(StatesGroup):
+    waiting_text = State()
+    waiting_audience = State()
+    waiting_confirm = State()
+
+
+def _audience_label(audience: str) -> str:
+    return {
+        "all": "🌍 Все клиенты",
+        "sleeping30": "😴 Спящие 30+ дней",
+        "vip": "⭐ VIP-клиенты",
+    }.get(audience, audience)
+
+
+@router.message(Command("broadcast"))
+async def broadcast_start(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    await state.set_state(BroadcastFlow.waiting_text)
+    await message.answer(
+        "📣 <b>Рассылка</b>\n\n"
+        "Пришлите текст рассылки (можно с HTML: &lt;b&gt;, &lt;i&gt;, &lt;a href&gt;). "
+        "Затем выберите аудиторию.\n"
+        "Отмена: /cancel"
+    )
+
+
+@router.message(BroadcastFlow.waiting_text)
+async def broadcast_text(
+    message: Message, state: FSMContext
+) -> None:
+    if not message.text:
+        await message.answer("Пришлите текст сообщением.")
+        return
+    text = message.text.strip()
+    if len(text) > 3500:
+        await message.answer("Текст длиннее 3500 символов — слишком много для одного сообщения.")
+        return
+    await state.update_data(bc_text=text)
+    await state.set_state(BroadcastFlow.waiting_audience)
+    await message.answer(
+        "Кому отправить?", reply_markup=kb.broadcast_audience_kb()
+    )
+
+
+@router.callback_query(BroadcastFlow.waiting_audience, F.data.startswith("bc:aud:"))
+async def broadcast_pick_audience(
+    call: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    settings: Settings,
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.data is None or call.message is None:
+        return
+    audience = call.data.split(":")[2]
+    rows = await db.list_broadcast_audience(audience)
+    data = await state.get_data()
+    text = data.get("bc_text") or ""
+    await state.update_data(bc_audience=audience, bc_count=len(rows))
+    await state.set_state(BroadcastFlow.waiting_confirm)
+    preview = text if len(text) < 600 else text[:600] + "…"
+    await call.message.answer(
+        f"<b>Аудитория:</b> {_audience_label(audience)} — {len(rows)} получателей.\n\n"
+        f"<b>Текст:</b>\n{preview}\n\n"
+        "Отправляем?",
+        reply_markup=kb.broadcast_confirm_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "bc:cancel")
+async def broadcast_cancel(
+    call: CallbackQuery, state: FSMContext, settings: Settings
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.message is None:
+        return
+    await state.clear()
+    await call.message.answer("Рассылка отменена.")
+    await call.answer()
+
+
+@router.callback_query(BroadcastFlow.waiting_confirm, F.data == "bc:send")
+async def broadcast_send(
+    call: CallbackQuery,
+    state: FSMContext,
+    db: Database,
+    bot: Bot,
+    settings: Settings,
+) -> None:
+    if not await _ensure_master(call, settings):
+        return
+    if call.message is None:
+        return
+    data = await state.get_data()
+    text = data.get("bc_text") or ""
+    audience = data.get("bc_audience") or "all"
+    await state.clear()
+    await call.message.answer(f"Начинаю рассылку: {_audience_label(audience)}…")
+    await call.answer()
+    sent, failed = await _do_broadcast(
+        bot=bot, db=db, audience=audience, text=text, kind="manual"
+    )
+    await call.message.answer(
+        f"📣 Готово.\n"
+        f"Отправлено: {sent}\nНе доставлено: {failed}"
+    )
+
+
+async def _do_broadcast(
+    *,
+    bot: Bot,
+    db: Database,
+    audience: str,
+    text: str,
+    kind: str = "manual",
+    mark_sleeping: bool = False,
+) -> tuple[int, int]:
+    rows = await db.list_broadcast_audience(audience)
+    sent = 0
+    failed = 0
+    for row in rows:
+        try:
+            await bot.send_message(int(row["tg_id"]), text)
+            sent += 1
+            if mark_sleeping:
+                await db.mark_sleeping_pinged(int(row["tg_id"]))
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            logger.warning("Broadcast failed for %s: %s", row["tg_id"], exc)
+    await db.record_broadcast(
+        text=text, audience=audience, sent=sent, failed=failed, kind=kind
+    )
+    return sent, failed
+
+
+# =====================================================================
+# Waitlist (#11) — список ожидания (master view)
+# =====================================================================
+
+
+@router.message(Command("waitlist"))
+async def waitlist_cmd(
+    message: Message, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    rows = await db.list_all_waitlist()
+    if not rows:
+        await message.answer("Список ожидания пуст.")
+        return
+    lines = [f"🕒 <b>Список ожидания</b> — {len(rows)} заявок:\n"]
+    for r in rows:
+        target = r["target_date"]
+        if r["target_time"]:
+            target += f" {r['target_time']}"
+        lines.append(
+            f"• <b>{r['service_name']}</b> на {target}\n"
+            f"  {r['client_name'] or 'клиент'} · {r['client_phone'] or '—'}"
+        )
+    await message.answer("\n".join(lines))
+
+
+# =====================================================================
+# Analytics (#12)
+# =====================================================================
+
+
+@router.message(Command("analytics"))
+async def analytics_cmd(
+    message: Message, db: Database, settings: Settings
+) -> None:
+    if not await _ensure_master(message, settings):
+        return
+    since = datetime.now() - timedelta(days=90)
+    top_services = await db.analytics_top_services(since=since, limit=5)
+    heatmap = await db.analytics_busy_heatmap(since=since)
+    funnel = await db.analytics_funnel(since=since)
+
+    parts: list[str] = ["📊 <b>Аналитика за 90 дней</b>\n"]
+
+    parts.append("<b>Топ услуг:</b>")
+    if not top_services:
+        parts.append("Пока нет данных — нужны завершённые записи.")
+    else:
+        for s in top_services:
+            visits = int(s["visits"] or 0)
+            revenue = int(s["revenue"] or 0)
+            parts.append(
+                f"• {s['name']} — {visits} визитов · {revenue}₽"
+            )
+
+    parts.append("")
+    parts.append("<b>Загрузка по дням:</b>")
+    weekday_totals: dict[int, int] = {i: 0 for i in range(7)}
+    hour_totals: dict[int, int] = {}
+    for row in heatmap:
+        # SQLite strftime('%w') returns 0=Sunday … 6=Saturday — convert to 0=Mon.
+        wd = (int(row["weekday_sun0"]) - 1) % 7
+        weekday_totals[wd] = weekday_totals.get(wd, 0) + int(row["cnt"])
+        h = int(row["hour"])
+        hour_totals[h] = hour_totals.get(h, 0) + int(row["cnt"])
+    if not heatmap:
+        parts.append("Пока нет записей.")
+    else:
+        max_wd = max(weekday_totals.values()) if weekday_totals else 0
+        for i, name in enumerate(kb.WEEKDAYS_FULL):
+            cnt = weekday_totals.get(i, 0)
+            bar = "▰" * (int(round(cnt / max_wd * 8)) if max_wd else 0)
+            parts.append(f"{name[:2]} {bar or '·'} {cnt}")
+        parts.append("")
+        parts.append("<b>Загрузка по часам:</b>")
+        max_h = max(hour_totals.values()) if hour_totals else 0
+        for h in sorted(hour_totals):
+            cnt = hour_totals[h]
+            bar = "▰" * (int(round(cnt / max_h * 8)) if max_h else 0)
+            parts.append(f"{h:02d}:00 {bar or '·'} {cnt}")
+
+    parts.append("")
+    parts.append("<b>Конверсия:</b>")
+    bookings = int(funnel.get("bookings") or 0)
+    completed = int(funnel.get("completed") or 0)
+    cancelled = int(funnel.get("cancelled") or 0)
+    rescheduled = int(funnel.get("rescheduled") or 0)
+    active = int(funnel.get("active") or 0)
+    closed = completed + cancelled  # already-resolved appointments
+    cancel_rate = (cancelled / closed * 100) if closed else 0.0
+    visit_conv = (completed / bookings * 100) if bookings else 0.0
+    parts.append(f"Всего записей: {bookings}")
+    parts.append(f"  ✅ завершено: {completed}")
+    parts.append(f"  ❌ отменено: {cancelled} ({cancel_rate:.1f}%)")
+    parts.append(f"  🔁 перенесено: {rescheduled}")
+    parts.append(f"  📅 активных: {active}")
+    parts.append(f"Конверсия запись → визит: <b>{visit_conv:.1f}%</b>")
+
+    await message.answer("\n".join(parts))

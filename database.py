@@ -47,7 +47,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         preferred_name TEXT,
         phone TEXT,
         last_service_id INTEGER,
-        last_appointment_id INTEGER
+        last_appointment_id INTEGER,
+        tg_username TEXT,
+        tg_first_name TEXT,
+        last_sleeping_ping DATETIME,
+        broadcast_opt_out INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -119,10 +123,66 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         value TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS client_notes (
+        tg_id INTEGER PRIMARY KEY,
+        note TEXT NOT NULL DEFAULT '',
+        updated_at DATETIME NOT NULL,
+        FOREIGN KEY(tg_id) REFERENCES users(tg_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS client_tags (
+        tg_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (tg_id, tag),
+        FOREIGN KEY(tg_id) REFERENCES users(tg_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS waitlist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        client_tg_id INTEGER NOT NULL,
+        service_id INTEGER NOT NULL,
+        target_date TEXT NOT NULL,
+        target_time TEXT,
+        client_name TEXT,
+        client_phone TEXT,
+        created_at DATETIME NOT NULL,
+        notified_at DATETIME,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        FOREIGN KEY(service_id) REFERENCES services(id),
+        FOREIGN KEY(client_tg_id) REFERENCES users(tg_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS broadcasts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        audience TEXT NOT NULL DEFAULT 'all',
+        created_at DATETIME NOT NULL,
+        sent_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        kind TEXT NOT NULL DEFAULT 'manual'
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_appt_client ON appointments(client_tg_id)",
     "CREATE INDEX IF NOT EXISTS idx_appt_dt ON appointments(datetime)",
     "CREATE INDEX IF NOT EXISTS idx_appt_status ON appointments(status)",
     "CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status)",
+    "CREATE INDEX IF NOT EXISTS idx_waitlist_target ON waitlist(target_date, service_id)",
+    "CREATE INDEX IF NOT EXISTS idx_tags_tag ON client_tags(tag)",
+)
+
+
+# Columns added after the initial schema; keep in sync with schema above.
+USERS_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("tg_username", "TEXT"),
+    ("tg_first_name", "TEXT"),
+    ("last_sleeping_ping", "DATETIME"),
+    ("broadcast_opt_out", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -163,13 +223,22 @@ class Database:
         self.path = str(path)
 
     async def init(self) -> None:
-        """Create tables and seed default rows."""
+        """Create tables, run column migrations, seed default rows."""
         async with self.connect() as conn:
             for stmt in SCHEMA_STATEMENTS:
                 await conn.execute(stmt)
+            await self._migrate_users(conn)
             await self._seed(conn)
             await conn.commit()
         logger.info("Database initialised at %s", self.path)
+
+    async def _migrate_users(self, conn: aiosqlite.Connection) -> None:
+        """Add missing columns from USERS_MIGRATIONS (idempotent)."""
+        cur = await conn.execute("PRAGMA table_info(users)")
+        existing = {row[1] for row in await cur.fetchall()}
+        for col, ddl in USERS_MIGRATIONS:
+            if col not in existing:
+                await conn.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
 
     async def _seed(self, conn: aiosqlite.Connection) -> None:
         # default settings
@@ -230,7 +299,12 @@ class Database:
         return await self.fetchone("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
 
     async def upsert_user_visit(
-        self, tg_id: int, role: str = "client"
+        self,
+        tg_id: int,
+        role: str = "client",
+        *,
+        username: str | None = None,
+        first_name: str | None = None,
     ) -> tuple[bool, aiosqlite.Row]:
         """Insert or update a user; return (is_new, row)."""
         existing = await self.get_user(tg_id)
@@ -238,10 +312,13 @@ class Database:
         if existing is None:
             await self.execute(
                 """
-                INSERT INTO users(tg_id, role, first_seen, last_interaction, total_visits)
-                VALUES (?, ?, ?, ?, 1)
+                INSERT INTO users(
+                    tg_id, role, first_seen, last_interaction, total_visits,
+                    tg_username, tg_first_name
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?)
                 """,
-                (tg_id, role, now, now),
+                (tg_id, role, now, now, username, first_name),
             )
             row = await self.get_user(tg_id)
             assert row is not None
@@ -250,10 +327,12 @@ class Database:
             """
             UPDATE users
                SET last_interaction = ?,
-                   total_visits = total_visits + 1
+                   total_visits = total_visits + 1,
+                   tg_username = COALESCE(?, tg_username),
+                   tg_first_name = COALESCE(?, tg_first_name)
              WHERE tg_id = ?
             """,
-            (now, tg_id),
+            (now, username, first_name, tg_id),
         )
         row = await self.get_user(tg_id)
         assert row is not None
@@ -645,3 +724,387 @@ class Database:
             """,
             (key, value),
         )
+
+    # -- CRM: clients listing ----------------------------------------------
+
+    async def list_clients(
+        self,
+        *,
+        only_role: str = "client",
+        sleeping_days: int | None = None,
+        top_spenders_only: bool = False,
+        with_tag: str | None = None,
+    ) -> list[aiosqlite.Row]:
+        """Return clients with aggregated visit/spending data and tag list."""
+        params: list[Any] = [only_role]
+        sql = """
+            SELECT
+                u.tg_id,
+                u.preferred_name,
+                u.phone,
+                u.tg_username,
+                u.tg_first_name,
+                u.first_seen,
+                u.last_interaction,
+                COALESCE(SUM(CASE WHEN a.status = 'completed'
+                                  THEN COALESCE(a.actual_amount, 0)
+                                  ELSE 0 END), 0) AS total_spent,
+                COALESCE(SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END), 0)
+                    AS completed_visits,
+                COALESCE(SUM(CASE WHEN a.status = 'cancelled' THEN 1 ELSE 0 END), 0)
+                    AS cancelled_visits,
+                MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
+                    AS last_visit_dt,
+                (SELECT GROUP_CONCAT(t.tag, ',')
+                   FROM client_tags t WHERE t.tg_id = u.tg_id) AS tags_csv
+              FROM users u
+              LEFT JOIN appointments a ON a.client_tg_id = u.tg_id
+             WHERE u.role = ?
+        """
+        if with_tag is not None:
+            sql += (
+                " AND EXISTS (SELECT 1 FROM client_tags t "
+                "WHERE t.tg_id = u.tg_id AND t.tag = ?)"
+            )
+            params.append(with_tag)
+        sql += " GROUP BY u.tg_id"
+        if sleeping_days is not None:
+            sql += (
+                " HAVING (last_visit_dt IS NULL"
+                "         OR datetime(last_visit_dt) <= datetime(?, ?))"
+            )
+            params.extend([_now(), f"-{int(sleeping_days)} days"])
+        if top_spenders_only:
+            sql += " ORDER BY total_spent DESC, completed_visits DESC"
+        else:
+            sql += " ORDER BY datetime(u.last_interaction) DESC"
+        return await self.fetchall(sql, params)
+
+    async def get_client_history(self, tg_id: int) -> list[aiosqlite.Row]:
+        return await self.fetchall(
+            """
+            SELECT a.*, s.name AS service_name, s.price AS service_price
+              FROM appointments a
+              JOIN services s ON s.id = a.service_id
+             WHERE a.client_tg_id = ?
+             ORDER BY a.datetime DESC
+            """,
+            (tg_id,),
+        )
+
+    async def client_summary(self, tg_id: int) -> dict[str, Any]:
+        row = await self.fetchone(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'completed'
+                                  THEN COALESCE(actual_amount, 0) ELSE 0 END), 0)
+                    AS total_spent,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END)
+                    AS completed,
+                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END)
+                    AS cancelled,
+                SUM(CASE WHEN status = 'rescheduled' THEN 1 ELSE 0 END)
+                    AS rescheduled,
+                MAX(CASE WHEN status = 'completed' THEN datetime END)
+                    AS last_visit_dt
+              FROM appointments
+             WHERE client_tg_id = ?
+            """,
+            (tg_id,),
+        )
+        return dict(row) if row else {
+            "total_spent": 0, "completed": 0, "cancelled": 0,
+            "rescheduled": 0, "last_visit_dt": None,
+        }
+
+    # -- CRM: tags & notes --------------------------------------------------
+
+    async def add_client_tag(self, tg_id: int, tag: str) -> bool:
+        async with self.connect() as conn:
+            cur = await conn.execute(
+                """
+                INSERT OR IGNORE INTO client_tags(tg_id, tag, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (tg_id, tag, _now()),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def remove_client_tag(self, tg_id: int, tag: str) -> bool:
+        async with self.connect() as conn:
+            cur = await conn.execute(
+                "DELETE FROM client_tags WHERE tg_id = ? AND tag = ?",
+                (tg_id, tag),
+            )
+            await conn.commit()
+            return cur.rowcount > 0
+
+    async def get_client_tags(self, tg_id: int) -> list[str]:
+        rows = await self.fetchall(
+            "SELECT tag FROM client_tags WHERE tg_id = ? ORDER BY tag",
+            (tg_id,),
+        )
+        return [r["tag"] for r in rows]
+
+    async def set_client_note(self, tg_id: int, note: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO client_notes(tg_id, note, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tg_id) DO UPDATE SET
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (tg_id, note, _now()),
+        )
+
+    async def get_client_note(self, tg_id: int) -> str:
+        row = await self.fetchone(
+            "SELECT note FROM client_notes WHERE tg_id = ?", (tg_id,)
+        )
+        return row["note"] if row else ""
+
+    # -- Waitlist -----------------------------------------------------------
+
+    async def add_to_waitlist(
+        self,
+        *,
+        client_tg_id: int,
+        service_id: int,
+        target_date: str,
+        target_time: str | None,
+        client_name: str | None,
+        client_phone: str | None,
+    ) -> int:
+        return await self.execute(
+            """
+            INSERT INTO waitlist(
+                client_tg_id, service_id, target_date, target_time,
+                client_name, client_phone, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                client_tg_id, service_id, target_date, target_time,
+                client_name, client_phone, _now(),
+            ),
+        )
+
+    async def list_waitlist_for_slot(
+        self, *, service_id: int, target_date: str
+    ) -> list[aiosqlite.Row]:
+        return await self.fetchall(
+            """
+            SELECT w.*, s.name AS service_name, s.duration_minutes AS service_duration
+              FROM waitlist w
+              JOIN services s ON s.id = w.service_id
+             WHERE w.status = 'waiting'
+               AND w.service_id = ?
+               AND w.target_date = ?
+             ORDER BY w.created_at
+            """,
+            (service_id, target_date),
+        )
+
+    async def list_active_waitlist_for_client(
+        self, client_tg_id: int
+    ) -> list[aiosqlite.Row]:
+        return await self.fetchall(
+            """
+            SELECT w.*, s.name AS service_name
+              FROM waitlist w
+              JOIN services s ON s.id = w.service_id
+             WHERE w.client_tg_id = ? AND w.status = 'waiting'
+             ORDER BY w.created_at DESC
+            """,
+            (client_tg_id,),
+        )
+
+    async def get_waitlist_entry(self, entry_id: int) -> aiosqlite.Row | None:
+        return await self.fetchone(
+            """
+            SELECT w.*, s.name AS service_name, s.price AS service_price,
+                   s.duration_minutes AS service_duration
+              FROM waitlist w
+              JOIN services s ON s.id = w.service_id
+             WHERE w.id = ?
+            """,
+            (entry_id,),
+        )
+
+    async def update_waitlist_status(
+        self, entry_id: int, status: str, *, mark_notified: bool = False
+    ) -> None:
+        if mark_notified:
+            await self.execute(
+                "UPDATE waitlist SET status = ?, notified_at = ? WHERE id = ?",
+                (status, _now(), entry_id),
+            )
+        else:
+            await self.execute(
+                "UPDATE waitlist SET status = ? WHERE id = ?",
+                (status, entry_id),
+            )
+
+    async def list_all_waitlist(self) -> list[aiosqlite.Row]:
+        return await self.fetchall(
+            """
+            SELECT w.*, s.name AS service_name
+              FROM waitlist w
+              JOIN services s ON s.id = w.service_id
+             WHERE w.status = 'waiting'
+             ORDER BY w.target_date, w.created_at
+            """
+        )
+
+    # -- Broadcasts ---------------------------------------------------------
+
+    async def list_broadcast_audience(
+        self, audience: str
+    ) -> list[aiosqlite.Row]:
+        """Return user rows for a given audience selection."""
+        if audience == "sleeping30":
+            return await self.fetchall(
+                """
+                SELECT u.*, MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
+                            AS last_visit_dt
+                  FROM users u
+                  LEFT JOIN appointments a ON a.client_tg_id = u.tg_id
+                 WHERE u.role = 'client' AND COALESCE(u.broadcast_opt_out, 0) = 0
+                 GROUP BY u.tg_id
+                HAVING (last_visit_dt IS NULL
+                        OR datetime(last_visit_dt) <= datetime(?, '-30 days'))
+                """,
+                (_now(),),
+            )
+        if audience == "vip":
+            return await self.fetchall(
+                """
+                SELECT DISTINCT u.*
+                  FROM users u
+                  JOIN client_tags t ON t.tg_id = u.tg_id
+                 WHERE u.role = 'client' AND COALESCE(u.broadcast_opt_out, 0) = 0
+                   AND t.tag = 'VIP'
+                """
+            )
+        # default: all clients
+        return await self.fetchall(
+            """
+            SELECT * FROM users
+             WHERE role = 'client' AND COALESCE(broadcast_opt_out, 0) = 0
+            """
+        )
+
+    async def record_broadcast(
+        self,
+        *,
+        text: str,
+        audience: str,
+        sent: int,
+        failed: int,
+        kind: str = "manual",
+    ) -> int:
+        return await self.execute(
+            """
+            INSERT INTO broadcasts(text, audience, created_at, sent_count, failed_count, kind)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (text, audience, _now(), sent, failed, kind),
+        )
+
+    async def mark_sleeping_pinged(self, tg_id: int) -> None:
+        await self.execute(
+            "UPDATE users SET last_sleeping_ping = ? WHERE tg_id = ?",
+            (_now(), tg_id),
+        )
+
+    async def list_sleeping_for_auto_ping(
+        self, *, days: int = 30, cooldown_days: int = 30
+    ) -> list[aiosqlite.Row]:
+        """Sleeping clients we haven't pinged in the last cooldown_days."""
+        return await self.fetchall(
+            """
+            SELECT u.*, MAX(CASE WHEN a.status = 'completed' THEN a.datetime END)
+                        AS last_visit_dt
+              FROM users u
+              LEFT JOIN appointments a ON a.client_tg_id = u.tg_id
+             WHERE u.role = 'client'
+               AND COALESCE(u.broadcast_opt_out, 0) = 0
+             GROUP BY u.tg_id
+            HAVING last_visit_dt IS NOT NULL
+               AND datetime(last_visit_dt) <= datetime(?, ?)
+               AND (u.last_sleeping_ping IS NULL
+                    OR datetime(u.last_sleeping_ping) <= datetime(?, ?))
+            """,
+            (
+                _now(), f"-{int(days)} days",
+                _now(), f"-{int(cooldown_days)} days",
+            ),
+        )
+
+    # -- Analytics ---------------------------------------------------------
+
+    async def analytics_top_services(
+        self, since: datetime | None = None, limit: int = 5
+    ) -> list[aiosqlite.Row]:
+        params: list[Any] = []
+        sql = """
+            SELECT s.id, s.name,
+                   SUM(CASE WHEN a.status = 'completed' THEN 1 ELSE 0 END) AS visits,
+                   SUM(CASE WHEN a.status = 'completed'
+                            THEN COALESCE(a.actual_amount, 0) ELSE 0 END) AS revenue,
+                   SUM(CASE WHEN a.status IN ('active','completed','cancelled','rescheduled')
+                            THEN 1 ELSE 0 END) AS bookings
+              FROM services s
+              LEFT JOIN appointments a ON a.service_id = s.id
+        """
+        if since is not None:
+            sql += " AND datetime(a.datetime) >= datetime(?)"
+            params.append(to_str(since))
+        sql += " GROUP BY s.id ORDER BY visits DESC, revenue DESC LIMIT ?"
+        params.append(limit)
+        return await self.fetchall(sql, params)
+
+    async def analytics_busy_heatmap(
+        self, since: datetime | None = None
+    ) -> list[aiosqlite.Row]:
+        """(weekday 0-6, hour 0-23, count) of completed/active appointments."""
+        params: list[Any] = []
+        sql = """
+            SELECT CAST(strftime('%w', datetime) AS INT) AS weekday_sun0,
+                   CAST(strftime('%H', datetime) AS INT) AS hour,
+                   COUNT(*) AS cnt
+              FROM appointments
+             WHERE status IN ('active','completed')
+        """
+        if since is not None:
+            sql += " AND datetime(datetime) >= datetime(?)"
+            params.append(to_str(since))
+        sql += " GROUP BY weekday_sun0, hour"
+        return await self.fetchall(sql, params)
+
+    async def analytics_funnel(
+        self, since: datetime | None = None
+    ) -> dict[str, int]:
+        params: list[Any] = []
+        where = ""
+        if since is not None:
+            where = " WHERE datetime(created_at) >= datetime(?)"
+            params.append(to_str(since))
+        row = await self.fetchone(
+            f"""
+            SELECT
+                COUNT(*) AS bookings,
+                SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                SUM(CASE WHEN status='rescheduled' THEN 1 ELSE 0 END) AS rescheduled,
+                SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active
+              FROM appointments
+              {where}
+            """,
+            params,
+        )
+        return dict(row) if row else {
+            "bookings": 0, "completed": 0, "cancelled": 0,
+            "rescheduled": 0, "active": 0,
+        }

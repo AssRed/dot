@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
@@ -13,6 +13,7 @@ import keyboards as kb
 from config import Settings
 from database import Database, to_dt
 from utils.slots import available_dates, available_slots_for_day
+from utils.waitlist import notify_waitlist_for_freed_slot
 
 logger = logging.getLogger(__name__)
 router = Router(name="client")
@@ -164,10 +165,13 @@ async def book_choose_date(
         return
     days = await available_dates(db, duration_minutes=int(service["duration_minutes"]))
     if not days:
+        # Offer to join the waitlist for the nearest day.
+        target = date.today() + timedelta(days=1)
         await call.message.edit_text(
-            "К сожалению, на ближайшие 14 дней свободных слотов нет 😔\n"
-            "Попробуйте позже или напишите мастеру напрямую.",
-            reply_markup=kb.main_menu_kb(),
+            "К сожалению, на ближайшие 14 дней свободных слотов нет 😔\n\n"
+            "Хотите встать в список ожидания? Если у мастера освободится окно — "
+            "сообщу первым.",
+            reply_markup=kb.waitlist_offer_kb(service_id, target.isoformat()),
         )
         await state.clear()
         await call.answer()
@@ -200,12 +204,10 @@ async def book_choose_slot(
     )
     if not slots:
         await call.message.edit_text(
-            "На этот день уже не осталось свободных слотов 😔",
-            reply_markup=kb.dates_kb(
-                await available_dates(db, duration_minutes=int(service["duration_minutes"])),
-                service_id=service_id,
-                purpose="book",
-            ),
+            "На этот день уже не осталось свободных слотов 😔\n\n"
+            "Можно встать в список ожидания на этот день — пришлю уведомление, "
+            "если кто-то отменит.",
+            reply_markup=kb.waitlist_offer_kb(service_id, day.isoformat()),
         )
         await call.answer()
         return
@@ -506,6 +508,13 @@ async def _do_cancel(
         f"Телефон: {appt['client_phone']}"
         f"{reason_line}",
     )
+    if appt_dt is not None:
+        await notify_waitlist_for_freed_slot(
+            bot=bot,
+            db=db,
+            service_id=int(appt["service_id"]),
+            freed_dt=appt_dt,
+        )
 
 
 @router.callback_query(CancelFlow.waiting_reason, F.data == "appt:reason:skip")
@@ -697,4 +706,113 @@ async def reschedule_pick_slot(
         f"Имя: {appt['client_name']}\n"
         f"Телефон: {appt['client_phone']}",
     )
+    if old_dt is not None:
+        await notify_waitlist_for_freed_slot(
+            bot=bot, db=db, service_id=int(appt["service_id"]), freed_dt=old_dt
+        )
     await call.answer("Перенесли!")
+
+
+# -- waitlist (client side) -----------------------------------------------
+
+
+@router.callback_query(F.data.startswith("wl:join:"))
+async def waitlist_join(
+    call: CallbackQuery, db: Database, bot: Bot, settings: Settings
+) -> None:
+    if call.message is None or call.data is None or call.from_user is None:
+        return
+    parts = call.data.split(":", 3)
+    service_id = int(parts[2])
+    target_date = parts[3]
+    service = await db.get_service(service_id)
+    if service is None:
+        await call.answer("Услуга не найдена", show_alert=True)
+        return
+    user = await db.get_user(call.from_user.id)
+    name = (
+        (user["preferred_name"] if user else None)
+        or call.from_user.first_name
+        or "клиент"
+    )
+    phone = user["phone"] if user else None
+    entry_id = await db.add_to_waitlist(
+        client_tg_id=call.from_user.id,
+        service_id=service_id,
+        target_date=target_date,
+        target_time=None,
+        client_name=name,
+        client_phone=phone,
+    )
+    try:
+        target_human = datetime.fromisoformat(target_date).strftime("%d.%m.%Y")
+    except ValueError:
+        target_human = target_date
+    await call.message.edit_text(
+        "🕒 Вы в списке ожидания!\n\n"
+        f"Услуга: <b>{service['name']}</b>\n"
+        f"Дата: <b>{target_human}</b>\n\n"
+        "Если у мастера освободится окно — пришлю уведомление.",
+        reply_markup=kb.main_menu_kb(),
+    )
+    await call.answer("Добавили в список ожидания")
+    await _notify_master(
+        bot,
+        settings,
+        f"🕒 <b>Новая заявка в waitlist #{entry_id}</b>\n"
+        f"Услуга: {service['name']}\n"
+        f"Дата: {target_human}\n"
+        f"Клиент: {name} · {phone or '—'}",
+    )
+
+
+@router.callback_query(F.data.startswith("wl:drop:"))
+async def waitlist_drop(
+    call: CallbackQuery, db: Database
+) -> None:
+    if call.message is None or call.data is None or call.from_user is None:
+        return
+    entry_id = int(call.data.split(":")[2])
+    entry = await db.get_waitlist_entry(entry_id)
+    if entry is None or int(entry["client_tg_id"]) != call.from_user.id:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    await db.update_waitlist_status(entry_id, "cancelled")
+    await call.message.edit_text(
+        "Хорошо, убрали вас из списка ожидания. Спасибо! 🌸",
+        reply_markup=kb.main_menu_kb(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("wl:book:"))
+async def waitlist_book(
+    call: CallbackQuery, state: FSMContext, db: Database
+) -> None:
+    """Shortcut: launch the booking flow pre-filled with the waitlisted service."""
+    if call.message is None or call.data is None or call.from_user is None:
+        return
+    entry_id = int(call.data.split(":")[2])
+    entry = await db.get_waitlist_entry(entry_id)
+    if entry is None or int(entry["client_tg_id"]) != call.from_user.id:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    # Mark entry fulfilled regardless — if booking ultimately fails the user
+    # can hit waitlist again.
+    await db.update_waitlist_status(entry_id, "fulfilled")
+    service_id = int(entry["service_id"])
+    service = await db.get_service(service_id)
+    if service is None:
+        await call.answer("Услуга больше недоступна", show_alert=True)
+        return
+    await state.set_state(BookingFlow.confirming_service)
+    await state.update_data(service_id=service_id)
+    description = service["description"] or "Все детали уточнит мастер при встрече."
+    text = (
+        f"<b>{service['name']}</b>\n"
+        f"💰 {service['price']}₽ · ⏱ {service['duration_minutes']} мин\n\n"
+        f"{description}\n\n"
+        "Записаться на эту услугу?"
+    )
+    await call.message.answer(text, reply_markup=kb.confirm_service_kb(service_id))
+    await call.answer()

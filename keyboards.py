@@ -397,3 +397,197 @@ def welcome_type_kb() -> InlineKeyboardMarkup:
 def upcoming_dates(days: int = 14, *, start_offset: int = 1) -> list[date]:
     today = date.today()
     return [today + timedelta(days=start_offset + i) for i in range(days)]
+
+
+# ---------- mini-landing (deep-link) ----------------------------------------
+
+
+def landing_cta_kb(*, has_services: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_services:
+        rows.append(
+            _row(
+                InlineKeyboardButton(
+                    text="📅 Записаться",
+                    callback_data="book:start",
+                )
+            )
+        )
+        rows.append(
+            _row(
+                InlineKeyboardButton(
+                    text="💅 Все услуги и цены",
+                    callback_data="services:list",
+                )
+            )
+        )
+    rows.append(
+        _row(
+            InlineKeyboardButton(text="🏠 Меню", callback_data="menu:main"),
+        )
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------- waitlist --------------------------------------------------------
+
+
+def waitlist_offer_kb(service_id: int, day_iso: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row(
+                InlineKeyboardButton(
+                    text="🕒 В список ожидания",
+                    callback_data=f"wl:join:{service_id}:{day_iso}",
+                )
+            ),
+            _row(
+                InlineKeyboardButton(text="« Меню", callback_data="menu:main"),
+            ),
+        ]
+    )
+
+
+def waitlist_book_kb(entry_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row(
+                InlineKeyboardButton(
+                    text="📅 Записаться",
+                    callback_data=f"wl:book:{entry_id}",
+                )
+            ),
+            _row(
+                InlineKeyboardButton(
+                    text="❌ Снять заявку",
+                    callback_data=f"wl:drop:{entry_id}",
+                ),
+            ),
+        ]
+    )
+
+
+# ---------- CRM (master) ----------------------------------------------------
+
+
+def clients_filter_kb(active: str = "recent") -> InlineKeyboardMarkup:
+    def label(name: str, key: str) -> str:
+        return f"• {name} •" if active == key else name
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row(
+                InlineKeyboardButton(
+                    text=label("Все", "recent"),
+                    callback_data="crm:filter:recent",
+                ),
+                InlineKeyboardButton(
+                    text=label("Спящие 30+", "sleeping"),
+                    callback_data="crm:filter:sleeping",
+                ),
+            ),
+            _row(
+                InlineKeyboardButton(
+                    text=label("Топ по тратам", "top"),
+                    callback_data="crm:filter:top",
+                ),
+                InlineKeyboardButton(
+                    text=label("VIP", "vip"),
+                    callback_data="crm:filter:vip",
+                ),
+            ),
+        ]
+    )
+
+
+CLIENT_TAGS = ("VIP", "аллергия", "сложный", "новичок")
+
+
+def client_card_kb(tg_id: int, *, tags: list[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    pair: list[InlineKeyboardButton] = []
+    for tag in CLIENT_TAGS:
+        marker = "✅" if tag in tags else "➕"
+        pair.append(
+            InlineKeyboardButton(
+                text=f"{marker} {tag}",
+                callback_data=f"crm:tag:{tg_id}:{tag}",
+            )
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append(
+        _row(
+            InlineKeyboardButton(
+                text="📝 Заметка",
+                callback_data=f"crm:note:{tg_id}",
+            ),
+            InlineKeyboardButton(
+                text="📜 История",
+                callback_data=f"crm:hist:{tg_id}",
+            ),
+        )
+    )
+    rows.append(
+        _row(
+            InlineKeyboardButton(
+                text="« К списку",
+                callback_data="crm:filter:recent",
+            ),
+        )
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ---------- broadcasts ------------------------------------------------------
+
+
+def broadcast_audience_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row(
+                InlineKeyboardButton(
+                    text="🌍 Все клиенты",
+                    callback_data="bc:aud:all",
+                )
+            ),
+            _row(
+                InlineKeyboardButton(
+                    text="😴 Спящие 30+ дней",
+                    callback_data="bc:aud:sleeping30",
+                )
+            ),
+            _row(
+                InlineKeyboardButton(
+                    text="⭐ VIP-клиенты",
+                    callback_data="bc:aud:vip",
+                )
+            ),
+            _row(
+                InlineKeyboardButton(
+                    text="🚫 Отмена",
+                    callback_data="bc:cancel",
+                )
+            ),
+        ]
+    )
+
+
+def broadcast_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            _row(
+                InlineKeyboardButton(
+                    text="✅ Отправить",
+                    callback_data="bc:send",
+                ),
+                InlineKeyboardButton(
+                    text="🚫 Отмена",
+                    callback_data="bc:cancel",
+                ),
+            )
+        ]
+    )
