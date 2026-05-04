@@ -170,7 +170,7 @@ Railway даёт $5 trial-кредит при привязке карты, по�
 
 1. https://railway.app → Sign in with GitHub.
 2. **New Project** → **Deploy from GitHub repo** → выбрать `AssRed/dot`.
-3. Railway автоматически прочитает `railway.json` и запустит `python main.py`.
+3. Railway автоматически прочитает `railway.json` и запустит `uvicorn app:app` (webhook-режим).
 4. Перейти в **Settings → Volumes** → **Create Volume**:
    - **Mount path**: `/data`
    - Size: 1 GB (хватит на годы записей)
@@ -180,6 +180,10 @@ Railway даёт $5 trial-кредит при привязке карты, по�
    - `DB_PATH=/data/bot.db` — чтобы база жила в volume
    - (опционально) `TZ=Europe/Moscow`
 6. Дождаться зелёной галочки **Active**. В Telegram открыть бота, отправить `/start`.
+
+Webhook-URL Railway вычисляет сам из переменной `RAILWAY_PUBLIC_DOMAIN`,
+которую он автоматически выставляет каждому сервису. Если нужен кастомный
+домен — задайте `WEBHOOK_BASE_URL=https://yourdomain.com`.
 
 База `bot.db` живёт в volume — переживает редеплои и рестарты.
 

@@ -43,6 +43,12 @@ def _resolve_webhook_base() -> str | None:
     fly_app = os.getenv("FLY_APP_NAME", "").strip()
     if fly_app:
         return f"https://{fly_app}.fly.dev"
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_domain:
+        return f"https://{railway_domain.rstrip('/')}"
+    railway_static = os.getenv("RAILWAY_STATIC_URL", "").strip()
+    if railway_static:
+        return railway_static.rstrip("/")
     return None
 
 
